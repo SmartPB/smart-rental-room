@@ -542,6 +542,8 @@ function can(action){
     MANAGE_PROPERTIES: ['ADMIN','OWNER'],  // structural: create/edit/delete dorms & rooms
     MANAGE_RESERVATIONS: ['STAFF','ADMIN','OWNER'],   // front-desk: book/confirm/cancel room bookings
     REVIEW_METER: ['ADMIN','OWNER'],
+    SEND_BILLS: ['ADMIN','OWNER'],       // review invoices, then push them to each room's LINE group
+    REVIEW_SLIP: ['ADMIN','OWNER'],      // confirm the amount on a tenant's slip before payment is recorded
     APPROVE_SMALL_DISCOUNT: ['ADMIN','OWNER'],
     APPROVE_OWNER_ITEMS: ['OWNER'],      // void/refund/cancel/debt-waiver/large discount/reopen/rate change
     MANAGE_SETTINGS: ['OWNER'],
@@ -2012,6 +2014,168 @@ function renderBookings(root){
    VIEW: METER READINGS
    ============================================================ */
 let meterPeriodSel = currentPeriod();
+
+/* ---- Excel template / upload for monthly meter readings ---- */
+function loadXLSX(){
+  if(window.XLSX) return Promise.resolve(window.XLSX);
+  return new Promise((res,rej)=>{
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    sc.onload = ()=>window.XLSX ? res(window.XLSX) : rej(new Error('โหลดตัวอ่านไฟล์ Excel ไม่สำเร็จ'));
+    sc.onerror = ()=>rej(new Error('โหลดตัวอ่านไฟล์ Excel ไม่ได้ — ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่'));
+    document.head.appendChild(sc);
+  });
+}
+const sortedRoomsForSheet = ()=>scopedRooms().slice().sort((a,b)=>{
+  const pa=propertyById(a.propertyId), pb=propertyById(b.propertyId);
+  const ca=pa?pa.code:'', cb=pb?pb.code:'';
+  return ca!==cb ? (ca<cb?-1:1) : String(a.code).localeCompare(String(b.code),'en',{numeric:true});
+});
+async function downloadMeterTemplate(){
+  const X = await loadXLSX();
+  const period = meterPeriodSel;
+  const head = ['รหัสห้อง','หอพัก','มิเตอร์น้ำ ก่อนหน้า (ห้ามแก้)','มิเตอร์ไฟ ก่อนหน้า (ห้ามแก้)','มิเตอร์น้ำ (ปัจจุบัน)','มิเตอร์ไฟ (ปัจจุบัน)'];
+  const rows = [head];
+  sortedRoomsForSheet().forEach(r=>{
+    const prop = propertyById(r.propertyId);
+    const cell = type=>{
+      if(!meterRequired(r,type)) return '';
+      const pv = latestReadingFor(r.id,type,period); return pv ? pv.value : '';
+    };
+    const cur = type=>{ const rd = readingFor(r.id,type,period); return rd ? rd.value : ''; };
+    rows.push([r.code, prop?prop.code:'', cell('water'), cell('elec'), meterRequired(r,'water')?cur('water'):'', meterRequired(r,'elec')?cur('elec'):'']);
+  });
+  const ws = X.utils.aoa_to_sheet(rows);
+  ws['!cols'] = [{wch:12},{wch:8},{wch:22},{wch:22},{wch:22},{wch:22}];
+  const guide = X.utils.aoa_to_sheet([
+    ['วิธีใช้เทมเพลตมิเตอร์ — งวด '+periodLabel(period)],
+    ['1) กรอกเลขมิเตอร์ปัจจุบันในคอลัมน์ "มิเตอร์น้ำ (ปัจจุบัน)" และ "มิเตอร์ไฟ (ปัจจุบัน)" (ห้องที่ไม่มีมิเตอร์/ไม่คิดเงินปล่อยว่างได้)'],
+    ['2) ห้ามเปลี่ยนชื่อคอลัมน์และรหัสห้อง ใช้ตัวเลขล้วน ทศนิยมได้'],
+    ['3) ห้องว่างและห้องปิดซ่อมก็ต้องกรอก เพื่อใช้ตรวจสอบการใช้น้ำ-ไฟในห้องว่าง'],
+    ['4) อัปโหลดที่หน้า มิเตอร์น้ำ-ไฟ → อัปโหลด Excel ระบบจะแสดงตัวอย่างและตรวจความผิดปกติให้ก่อนนำเข้า'],
+  ]);
+  guide['!cols'] = [{wch:110}];
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, ws, 'มิเตอร์');
+  X.utils.book_append_sheet(wb, guide, 'วิธีใช้');
+  X.writeFile(wb, 'meter_template_'+period+'.xlsx');
+}
+/* tolerant parser: finds the header row (has "ห้อง"/room), then the water / electricity "current" columns.
+   Works with the official template and with a separate sheet per meter type. */
+function parseMeterWorkbook(X, wb){
+  const out = new Map();     // roomCode(upper) -> {code, water, elec}
+  const notes = [];
+  const num = v=>{ if(v===null||v===undefined||v==='') return null; const n = Number(String(v).replace(/[,\s]/g,'')); return Number.isFinite(n) ? n : NaN; };
+  wb.SheetNames.forEach(name=>{
+    const aoa = X.utils.sheet_to_json(wb.Sheets[name], {header:1, raw:true, defval:null});
+    let hi = -1;
+    for(let i=0;i<Math.min(aoa.length,15);i++){ if((aoa[i]||[]).some(c=>typeof c==='string' && c.trim().length<=25 && /ห้อง|room/i.test(c))){ hi=i; break; } }
+    if(hi<0) return;
+    const hdr = aoa[hi].map(c=>String(c==null?'':c).trim());
+    const lower = hdr.map(h=>h.toLowerCase());
+    const roomCol = (()=>{ const a = hdr.findIndex(h=>/^(รหัสห้อง|เลขห้อง|ห้อง|room(\s*(code|no\.?))?)$/i.test(h)); return a>=0 ? a : hdr.findIndex(h=>h.length<=25 && /ห้อง|room/i.test(h)); })();
+    const isPrev = h=>/ก่อนหน้า|เดิม|prev|ห้ามแก้/i.test(h);
+    const find = (kw)=>{
+      let c = hdr.findIndex((h,i)=>kw.test(h) && /ปัจจุบัน|current|ใหม่|ล่าสุด/i.test(h) && !isPrev(h));
+      if(c<0) c = hdr.findIndex((h,i)=>kw.test(h) && !isPrev(h));
+      return c;
+    };
+    let wc = find(/น้ำ|water/i), ec = find(/ไฟ|elec/i);
+    const sn = name.toLowerCase();
+    if(wc<0 && ec<0){          // one-type sheet: pick the "current" column by sheet name
+      const cur = hdr.findIndex((h,i)=>i!==roomCol && /ปัจจุบัน|current|ใหม่|ล่าสุด/i.test(h) && !isPrev(h));
+      if(cur>=0){ if(/น้ำ|water/.test(sn)) wc = cur; else if(/ไฟ|elec/.test(sn)) ec = cur; }
+    }
+    if(wc<0 && ec<0){ notes.push('ชีต "'+name+'": ไม่พบคอลัมน์มิเตอร์'); return; }
+    for(let i=hi+1;i<aoa.length;i++){
+      const row = aoa[i]||[]; const code = String(row[roomCol]==null?'':row[roomCol]).trim();
+      if(!code) continue;
+      const key = code.toUpperCase().replace(/\s+/g,'');
+      if(!out.has(key)) out.set(key, {code, water:null, elec:null, rowNo:i+1});
+      const o = out.get(key);
+      if(wc>=0){ const v = num(row[wc]); if(v!==null) o.water = v; }
+      if(ec>=0){ const v = num(row[ec]); if(v!==null) o.elec = v; }
+    }
+  });
+  return {rows:[...out.values()], notes};
+}
+function buildMeterImportPlan(parsed, period){
+  const cfg = cache.config || {};
+  const byCode = new Map(activeRooms().map(r=>[String(r.code).toUpperCase().replace(/\s+/g,''), r]));
+  const items = []; const touched = new Set();
+  parsed.rows.forEach(pr=>{
+    const room = byCode.get(pr.code.toUpperCase().replace(/\s+/g,''));
+    ['water','elec'].forEach(type=>{
+      const v = pr[type]; if(v===null) return;
+      const it = {code:pr.code, type, value:v, room, prev:null, usage:null, level:'ok', note:''};
+      items.push(it);
+      if(!room){ it.level='err'; it.note='ไม่พบห้องนี้ในระบบ'; return; }
+      touched.add(room.id+'|'+type);
+      if(Number.isNaN(v) || v<0){ it.level='err'; it.note='ค่าไม่ใช่ตัวเลข'; return; }
+      if(!meterRequired(room,type)){ it.level='skip'; it.note='ห้องนี้ไม่คิด'+METER_TYPE_LABEL[type]+'แยกมิเตอร์ — ข้าม'; return; }
+      const ex = readingFor(room.id,type,period);
+      const pv = latestReadingFor(room.id,type,period);
+      it.prev = ex ? ex.previousValue : (pv ? pv.value : null);
+      if(ex && ex.locked){ it.level='skip'; it.note='ออกใบแจ้งหนี้แล้ว (ล็อก) — ข้าม'; return; }
+      if(it.prev===null){ it.level='err'; it.note='ยังไม่มีค่าตั้งต้นของมิเตอร์นี้ — บันทึกรายห้องก่อน'; return; }
+      if(v < it.prev){ it.level='err'; it.note='ต่ำกว่าค่าก่อนหน้า ('+it.prev+') — ถ้ามิเตอร์วน/เปลี่ยนให้บันทึกรายห้อง'; return; }
+      it.usage = Math.round((v-it.prev)*100)/100;
+      if(ex && ex.value===v){ it.level='skip'; it.note='เท่ากับที่บันทึกไว้แล้ว'; return; }
+      if(ex) { it.level='warn'; it.note='จะเขียนทับค่าเดิม '+ex.value; }
+      if(room.status!=='OCCUPIED' && it.usage > (cfg.vacantUsageThreshold||3)){ it.level='warn'; it.note=(it.note?it.note+' · ':'')+'ห้อง'+(room.status==='VACANT'?'ว่าง':'ไม่มีผู้เช่า')+'แต่ใช้ '+it.usage+' หน่วย — ตรวจสอบ'; }
+      const hist = cache.meterReadings.filter(r=>r.roomId===room.id && r.type===type && r.period<period && !r.baseline).sort((a,b)=>a.period<b.period?1:-1)[0];
+      if(hist && hist.usage>0 && room.status==='OCCUPIED' && Math.abs(it.usage-hist.usage)/hist.usage*100 > (cfg.anomalyPercent||50)){ it.level='warn'; it.note=(it.note?it.note+' · ':'')+'ผิดปกติจากเดือนก่อน ('+hist.usage+' → '+it.usage+')'; }
+    });
+  });
+  // rooms/meters required this period but not present in the file
+  const missing = [];
+  sortedRoomsForSheet().forEach(r=>['water','elec'].forEach(t=>{
+    if(meterRequired(r,t) && !readingFor(r.id,t,period) && !touched.has(r.id+'|'+t)) missing.push(r.code+(t==='water'?' (น้ำ)':' (ไฟ)'));
+  }));
+  return {items, missing};
+}
+function openMeterUploadModal(){
+  const period = meterPeriodSel; let plan = null;
+  const back = openModal({title:'อัปโหลด Excel มิเตอร์ — งวด '+periodLabel(period), wide:true, submitLabel:'นำเข้า', onSubmit: async ()=>{
+    if(!plan) throw new Error('เลือกไฟล์ Excel ก่อน');
+    const todo = plan.items.filter(i=>i.level==='ok'||i.level==='warn');
+    if(!todo.length) throw new Error('ไม่มีรายการที่นำเข้าได้');
+    let ok=0, fail=[];
+    for(const it of todo){
+      try{ await recordMeterReading({roomId:it.room.id, roomCode:it.room.code, type:it.type, value:it.value, period, photoDataUrl:''}); ok++; }
+      catch(e){ fail.push(it.code+' '+METER_TYPE_LABEL[it.type]+': '+e.message); }
+    }
+    await logAudit({action:'IMPORT_METER_EXCEL', entityType:'meterReading', entityId:'', newValue:{period, imported:ok, failed:fail.length}});
+    toast('นำเข้ามิเตอร์ '+ok+' รายการ'+(fail.length?' · ไม่สำเร็จ '+fail.length+' ('+fail[0]+')':''), fail.length?'warn':'ok');
+  }, bodyHtml:
+    '<div class="help-box">เลือกไฟล์ตามเทมเพลต (ดาวน์โหลดได้ที่ปุ่ม "ดาวน์โหลดเทมเพลต Excel") ระบบจะแสดงตัวอย่างและตรวจความผิดปกติก่อน ยังไม่บันทึกจนกว่าจะกด "นำเข้า" · ค่าที่นำเข้าจะอยู่สถานะ "รอตรวจสอบ" ให้ ADMIN/OWNER ยืนยัน และไม่มีรูปถ่ายแนบ</div>'+
+    '<div class="field"><label>ไฟล์ Excel (.xlsx / .xls / .csv)</label><input type="file" id="mtFile" accept=".xlsx,.xls,.csv"></div><div id="mtPrev"></div>'});
+  const submit = $('button[type=submit]', back); submit.disabled = true;
+  $('#mtFile', back).addEventListener('change', async e=>{
+    const f = e.target.files[0]; const box = $('#mtPrev', back); plan = null; submit.disabled = true;
+    if(!f) { box.innerHTML=''; return; }
+    box.innerHTML = '<p class="hint">กำลังอ่านไฟล์…</p>';
+    try{
+      const X = await loadXLSX(); const wb = X.read(await f.arrayBuffer(), {type:'array'});
+      const parsed = parseMeterWorkbook(X, wb);
+      if(!parsed.rows.length) throw new Error('ไม่พบข้อมูลมิเตอร์ในไฟล์ — ตรวจว่าใช้เทมเพลตและมีคอลัมน์ "รหัสห้อง" / "มิเตอร์น้ำ (ปัจจุบัน)" / "มิเตอร์ไฟ (ปัจจุบัน)"');
+      plan = buildMeterImportPlan(parsed, period);
+      const cnt = l=>plan.items.filter(i=>i.level===l).length;
+      const importable = cnt('ok')+cnt('warn');
+      const pill = {ok:'<span class="pill ok">นำเข้า</span>', warn:'<span class="pill warn">นำเข้า · ตรวจสอบ</span>', err:'<span class="pill bad">ไม่นำเข้า</span>', skip:'<span class="pill muted">ข้าม</span>'};
+      const shown = plan.items.slice().sort((a,b)=>({err:0,warn:1,ok:2,skip:3}[a.level]-{err:0,warn:1,ok:2,skip:3}[b.level]));
+      box.innerHTML =
+        '<p style="margin:8px 0;"><strong>นำเข้าได้ '+importable+' รายการ</strong>'+(cnt('warn')?' (ต้องตรวจ '+cnt('warn')+')':'')+(cnt('err')?' · <span style="color:var(--danger);">มีปัญหา '+cnt('err')+'</span>':'')+(cnt('skip')?' · ข้าม '+cnt('skip'):'')+'</p>'+
+        (plan.missing.length ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);">ยังไม่มีค่าในไฟล์/ระบบ '+plan.missing.length+' จุด: '+plan.missing.slice(0,15).join(', ')+(plan.missing.length>15?' …':'')+'</div>' : '')+
+        (parsed.notes.length ? '<p class="hint">'+parsed.notes.map(escapeHtml).join(' · ')+'</p>' : '')+
+        '<div class="tbl-wrap" style="max-height:340px;overflow:auto;"><table class="grid"><thead><tr><th>ห้อง</th><th>มิเตอร์</th><th>ก่อนหน้า</th><th>ใหม่</th><th>ใช้ไป</th><th>ผลตรวจ</th></tr></thead><tbody>'+
+        shown.map(i=>'<tr><td><b>'+escapeHtml(i.code)+'</b></td><td>'+METER_TYPE_LABEL[i.type]+'</td><td class="num">'+(i.prev==null?'-':i.prev)+'</td><td class="num">'+(Number.isNaN(i.value)?'-':i.value)+'</td><td class="num">'+(i.usage==null?'-':i.usage)+'</td><td>'+pill[i.level]+' <span style="font-size:12px;color:var(--text-muted);">'+escapeHtml(i.note)+'</span></td></tr>').join('')+
+        '</tbody></table></div>';
+      submit.disabled = importable===0; submit.textContent = 'นำเข้า '+importable+' รายการ';
+    }catch(err){ box.innerHTML = '<p style="color:var(--danger);font-size:13px;">'+escapeHtml(err.message)+'</p>'; }
+  });
+}
+
 function renderMeters(root){
   const periods = pastPeriods(currentPeriod(), 6);
   if(!periods.includes(meterPeriodSel)) meterPeriodSel = currentPeriod();
@@ -2023,11 +2187,14 @@ function renderMeters(root){
       (props.length>1? '<select id="meterPropSel" class="btn sm"><option value="ALL" '+(selectedPropertyId==='ALL'?'selected':'')+'>ทุกหอพัก</option>'+
         props.map(p=>'<option value="'+p.id+'" '+(p.id===selectedPropertyId?'selected':'')+'>'+escapeHtml(p.name)+' ('+p.code+')</option>').join('')+'</select>' : '')+
       '<select id="periodSel" class="btn sm">'+periods.slice().reverse().map(p=>'<option value="'+p+'" '+(p===meterPeriodSel?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select>'+
+      (can('RECORD_METER') ? '<button class="btn sm" id="mtTplBtn">'+icon('invoice')+' ดาวน์โหลดเทมเพลต Excel</button><button class="btn sm primary" id="mtUpBtn">'+icon('plus')+' อัปโหลด Excel</button>' : '')+
       '</div></div>'+
     '<div class="help-box">ต้นรอบบิลของทุกงวด ต้องจดมิเตอร์ครบทุกห้องที่มีมิเตอร์ ไม่ว่าห้องจะว่างหรือปิดซ่อมบำรุงก็ตาม เพื่อให้ตรวจสอบย้อนกลับได้เสมอ</div>'+
     '<div id="meterSummary"></div><div class="meter-grid" id="metersBody"></div>';
   if($('#meterPropSel')) $('#meterPropSel').addEventListener('change', e=>{ selectedPropertyId = e.target.value; route(); });
   $('#periodSel').addEventListener('change', e=>{ meterPeriodSel = e.target.value; renderMeters(root); });
+  if($('#mtTplBtn')) $('#mtTplBtn').addEventListener('click', ()=>downloadMeterTemplate().catch(e=>toast(e.message,'err')));
+  if($('#mtUpBtn')) $('#mtUpBtn').addEventListener('click', openMeterUploadModal);
   renderMetersBody();
 }
 /* One card per room: row1 = room code, row2 = room status (same header line),
@@ -2204,7 +2371,8 @@ function renderInvoices(root){
       '<div class="tag-row">'+
       (can('CREATE_INVOICE') && genEligible.length? '<button class="btn primary" id="bulkGenBtn">'+icon('invoice')+' ออกใบแจ้งหนี้ทุกห้อง งวด '+periodLabel(period)+' ('+genEligible.length+' ห้อง)</button>':'')+
       (can('CREATE_INVOICE')? '<button class="btn" id="newInvBtn">'+icon('plus')+' ออกใบแจ้งหนี้รายห้อง</button>':'')+
-      (rows.some(i=>i.status!=='cancelled') ? '<button class="btn" id="lineBtn">'+icon('send')+' แจ้งสรุปบิลเข้าไลน์</button>':'')+
+      (can('SEND_BILLS') && rows.some(i=>i.status==='unpaid') ? '<button class="btn primary" id="sendBillsBtn">'+icon('send')+' ตรวจสอบและส่งบิลเข้ากลุ่มห้อง</button>':'')+
+      (rows.some(i=>i.status!=='cancelled') ? '<button class="btn" id="lineBtn">'+icon('send')+' แจ้งสรุปเข้ากลุ่มพนักงาน</button>':'')+
       '</div></div>'+
     (gaps.length? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);color:var(--danger);">'+
       icon('bell')+' พบเลขที่ใบแจ้งหนี้ขาดหาย '+gaps.length+' เลข: '+gaps.map(g=>g.label).join(', ')+'</div>' : '')+
@@ -2219,7 +2387,8 @@ function renderInvoices(root){
     const waterInclusive = (i.waterMode||i.billingMode)==='INCLUSIVE';
     const elecInclusive = (i.elecMode||i.billingMode)==='INCLUSIVE';
     const waterFlat = i.waterMode==='FLAT';
-    return '<tr><td class="mono">'+(i.invoiceNumber||'-')+(i.replacesInvoiceId?'<div class="footnote">แทนใบเดิม</div>':'')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
+    return '<tr><td class="mono">'+(i.invoiceNumber||'-')+(i.replacesInvoiceId?'<div class="footnote">แทนใบเดิม</div>':'')+
+      (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
       '<td class="num">'+money(i.rentAmount)+'</td>'+
       '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':'')))+'</td>'+
       '<td class="num">'+(elecInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':money(i.elecAmount))+'</td>'+
@@ -2231,7 +2400,7 @@ function renderInvoices(root){
         (['unpaid','partial','pending_discount'].includes(i.status) ? ' <button class="btn sm" data-cancel="'+i.id+'">ขอยกเลิก</button>' : '')+
         (paid<i.total && i.status!=='cancelled' && i.status!=='waived' ? ' <button class="btn sm" data-waive="'+i.id+'">ขอยกหนี้</button>' : '')+
         (i.status==='cancelled' && !i.replacedByInvoiceId && can('CREATE_INVOICE') ? ' <button class="btn sm primary" data-reissue="'+i.id+'">ออกใบใหม่แทน</button>' : '')+
-        (i.status!=='cancelled' ? ' <button class="btn sm" data-line="'+i.id+'" title="แจ้งเข้ากลุ่มไลน์">'+icon('send')+' ไลน์</button>' : '')+
+        (can('SEND_BILLS') && ['unpaid','partial'].includes(i.status) ? ' <button class="btn sm'+(i.lineBillSentAt?'':' primary')+'" data-sendbill="'+i.id+'" title="ตรวจสอบแล้วส่งบิลเข้ากลุ่มไลน์ของห้อง">'+icon('send')+' '+(i.lineBillSentAt?'ส่งซ้ำ':'ส่งเข้ากลุ่มห้อง')+'</button>' : '')+
       '</td></tr>';
   }).join('');
   $all('[data-pay]', body).forEach(b=>b.addEventListener('click', ()=>openPaymentModal(cache.invoices.find(i=>i.id===b.dataset.pay))));
@@ -2253,7 +2422,8 @@ function renderInvoices(root){
   }));
   if($('#newInvBtn')) $('#newInvBtn').addEventListener('click', openInvoiceModal);
   if($('#lineBtn')) $('#lineBtn').addEventListener('click', ()=>openLineNotifyModal({period}));
-  $all('[data-line]', body).forEach(b=>b.addEventListener('click', ()=>openLineNotifyModal({invoices:[cache.invoices.find(i=>i.id===b.dataset.line)]})));
+  if($('#sendBillsBtn')) $('#sendBillsBtn').addEventListener('click', ()=>openSendBillsModal({period}));
+  $all('[data-sendbill]', body).forEach(b=>b.addEventListener('click', ()=>{ const inv = cache.invoices.find(i=>i.id===b.dataset.sendbill); openSendBillsModal({period:inv.period, onlyId:inv.id}); }));
   if($('#bulkGenBtn')) $('#bulkGenBtn').addEventListener('click', ()=>{
     confirmModal({title:'ออกใบแจ้งหนี้ทุกห้อง งวด '+periodLabel(period), submitLabel:'ยืนยันออกใบแจ้งหนี้ทั้งหมด', bodyHtml:
       '<p>ระบบจะสรุปและออกใบแจ้งหนี้ให้ทุกห้องที่มีผู้เช่าและยังไม่มีใบแจ้งหนี้งวดนี้ ('+genEligible.length+' ห้อง) โดยเรียงตามรหัสหอพักแล้วเลขห้อง คำนวณค่าเช่า/ค่าน้ำ-ไฟ/ค่าส่วนกลางจากข้อมูลห้องและมิเตอร์โดยอัตโนมัติ</p>',
@@ -2270,9 +2440,74 @@ function renderInvoices(root){
           catch(e){ fail++; failCodes.push(r.code); }
         }
         toast('ออกใบแจ้งหนี้สำเร็จ '+ok+' ห้อง'+(fail?' · ข้าม '+fail+' ห้อง ('+failCodes.slice(0,8).join(', ')+(failCodes.length>8?'…':'')+') — ยังไม่จดมิเตอร์หรือติดปัญหา':''), fail? 'warn':'ok');
-        if(ok>0) setTimeout(()=>openLineNotifyModal({period}), 400);   // สรุปบิลแล้ว → เสนอแจ้งเข้ากลุ่มไลน์ทันที
+        if(ok>0) toast('ออกใบแจ้งหนี้แล้ว — ยังไม่ส่งเข้ากลุ่มห้อง: ตรวจสอบยอดแล้วกด "ตรวจสอบและส่งบิลเข้ากลุ่มห้อง"','ok');
       }});
   });
+}
+
+
+/* ---- ADMIN/OWNER review, then send bills to each room's LINE group (never automatic) ---- */
+const RoomGroupsState = { map:null, error:'' };
+async function loadRoomGroups(){
+  try{ const r = await lineCall('room_groups'); RoomGroupsState.map = r.roomGroups||{}; RoomGroupsState.error=''; }
+  catch(e){ RoomGroupsState.map = {}; RoomGroupsState.error = e.message; }
+  return RoomGroupsState.map;
+}
+async function openSendBillsModal({period, onlyId}){
+  const periods = [...new Set(cache.invoices.filter(i=>i.status==='unpaid').map(i=>i.period))].sort().reverse();
+  if(period && !periods.includes(period)) periods.unshift(period);
+  const props = activeProperties();
+  const startProp = (selectedPropertyId!=='ALL' && props.some(p=>p.id===selectedPropertyId)) ? selectedPropertyId : 'ALL';
+  const state = {period: period||periods[0]||currentPeriod(), prop: startProp, resend:false};
+  const back = openModal({title: onlyId ? 'ส่งบิลเข้ากลุ่มห้อง' : 'ตรวจสอบและส่งบิลเข้ากลุ่มห้อง', wide:true, submitLabel:'ส่งบิลที่เลือก', onSubmit: async ()=>{
+    const ids = $all('input[data-sb]:checked', back).map(c=>c.dataset.sb);
+    if(!ids.length) throw new Error('ยังไม่ได้เลือกใบแจ้งหนี้');
+    const sent=[], noGroup=[], failed=[];
+    for(let i=0;i<ids.length;i+=100){
+      const r = await lineCall('send_bills', {invoiceIds: ids.slice(i,i+100), resend: state.resend});
+      sent.push(...r.sent); noGroup.push(...r.noGroup); failed.push(...r.failed);
+    }
+    toast('ส่งบิลเข้ากลุ่มแล้ว '+sent.length+' ห้อง'+(noGroup.length?' · ไม่มีกลุ่ม: '+noGroup.join(', '):'')+(failed.length?' · ส่งไม่สำเร็จ: '+failed.join(', '):''), (noGroup.length||failed.length)?'warn':'ok');
+  }, bodyHtml:
+    '<div class="help-box">ตรวจยอดแต่ละห้องให้ถูกต้องก่อนส่ง · ระบบ<b>ไม่ส่งบิลอัตโนมัติ</b> · ห้องที่ยังไม่ผูกกลุ่มไลน์จะไม่ได้รับบิล และระบบจะแจ้งรายชื่อห้องเหล่านั้นเข้ากลุ่มพนักงาน</div>'+
+    (onlyId ? '' : '<div class="field-row"><div class="field"><label>งวดบิล</label><select id="sbPeriod">'+periods.map(p=>'<option value="'+p+'" '+(p===state.period?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select></div>'+
+      '<div class="field"><label>หอพัก</label><select id="sbProp"><option value="ALL">ทุกหอพัก</option>'+props.map(p=>'<option value="'+p.id+'" '+(p.id===state.prop?'selected':'')+'>'+escapeHtml(p.name)+' ('+p.code+')</option>').join('')+'</select></div></div>')+
+    '<div id="sbWarn"></div><div id="sbList"><p class="hint">กำลังโหลดกลุ่มไลน์…</p></div>'});
+  const submit = $('button[type=submit]', back); submit.disabled = true;
+  const map = await loadRoomGroups();
+  function draw(){
+    const rooms = new Map(activeRooms().map(r=>[r.id,r]));
+    let list = cache.invoices.filter(i=>['unpaid'].includes(i.status) && (onlyId ? i.id===onlyId : i.period===state.period) && (state.prop==='ALL' || i.propertyId===state.prop));
+    if(onlyId && !list.length) list = cache.invoices.filter(i=>i.id===onlyId);
+    list.sort((a,b)=>{ const pa=(propertyById(a.propertyId)||{}).code||'', pb=(propertyById(b.propertyId)||{}).code||''; return pa!==pb?(pa<pb?-1:1):String(a.roomCode).localeCompare(String(b.roomCode),'en',{numeric:true}); });
+    const pend = cache.invoices.filter(i=>i.status==='pending_discount' && i.period===state.period && (state.prop==='ALL'||i.propertyId===state.prop)).length;
+    $('#sbWarn', back).innerHTML = (RoomGroupsState.error ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);">โหลดข้อมูลกลุ่มไลน์ไม่ได้: '+escapeHtml(RoomGroupsState.error)+'</div>' : '')+
+      (pend ? '<div class="help-box">มี '+pend+' ใบที่รออนุมัติส่วนลด — ยังไม่แสดงในรายการส่ง</div>' : '');
+    const noG = list.filter(i=>!map[i.roomId]).length;
+    $('#sbList', back).innerHTML = !list.length ? '<p class="hint">ไม่มีใบแจ้งหนี้ที่รอส่งในตัวเลือกนี้</p>' :
+      '<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:6px 0;">'+
+        '<label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;"><input type="checkbox" id="sbAll" style="width:auto;" checked> เลือกทั้งหมดที่ส่งได้</label>'+
+        '<label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;"><input type="checkbox" id="sbResend" style="width:auto;" '+(state.resend?'checked':'')+'> ส่งซ้ำใบที่เคยส่งแล้ว</label>'+
+        '<span class="hint" id="sbCount"></span></div>'+
+      '<div class="tbl-wrap" style="max-height:380px;overflow:auto;"><table class="grid"><thead><tr><th></th><th>ห้อง</th><th>รายการ</th><th>รวม</th><th>สถานะการส่ง</th><th>กลุ่มไลน์</th></tr></thead><tbody>'+
+      list.map(i=>{
+        const has = !!map[i.roomId];
+        const sentTxt = i.lineBillSentAt ? '<span class="pill ok">ส่งแล้ว '+fmtDateTime(i.lineBillSentAt)+'</span>' : '<span class="pill warn">ยังไม่ส่ง</span>';
+        const def = has && (!i.lineBillSentAt || state.resend);
+        return '<tr><td><input type="checkbox" data-sb="'+i.id+'" style="width:auto;" '+(def?'checked':'')+(has?'':' disabled')+'></td><td><b>'+escapeHtml(i.roomCode)+'</b></td>'+
+          '<td style="font-size:12px;">'+escapeHtml(invoiceBreakdown(i).join(' + '))+'</td><td class="num"><b>'+money(i.total)+'</b></td><td>'+sentTxt+'</td>'+
+          '<td>'+(has?'<span class="pill ok">ผูกแล้ว</span>':'<span class="pill bad">ยังไม่มีกลุ่ม</span>')+'</td></tr>';
+      }).join('')+'</tbody></table></div>'+(noG? '<p class="hint" style="color:var(--danger);">'+noG+' ห้องยังไม่มีกลุ่มไลน์ — จะไม่ได้รับบิล (ผูกกลุ่มได้ที่ ตั้งค่าระบบ → ระบบอัตโนมัติ)</p>' : '');
+    const upd = ()=>{ const n = $all('input[data-sb]:checked', back).length; $('#sbCount', back) && ($('#sbCount', back).textContent = 'เลือกส่ง '+n+' ใบ'); submit.disabled = n===0; };
+    $all('input[data-sb]', back).forEach(c=>c.addEventListener('change', upd));
+    const all = $('#sbAll', back); if(all) all.addEventListener('change', ()=>{ $all('input[data-sb]:not(:disabled)', back).forEach(c=>{ const inv = cache.invoices.find(x=>x.id===c.dataset.sb); c.checked = all.checked && (!inv.lineBillSentAt || state.resend); }); upd(); });
+    const rs = $('#sbResend', back); if(rs) rs.addEventListener('change', ()=>{ state.resend = rs.checked; draw(); });
+    upd();
+  }
+  const ps = $('#sbPeriod', back), pr = $('#sbProp', back);
+  if(ps) ps.addEventListener('change', ()=>{ state.period = ps.value; draw(); });
+  if(pr) pr.addEventListener('change', ()=>{ state.prop = pr.value; draw(); });
+  draw();
 }
 
 /* ---- แจ้งบิลเข้ากลุ่มไลน์ ---- */
@@ -2469,17 +2704,17 @@ async function initAutoSettings(card){
     '<form id="autoForm">'+
       chk('enabled', a.enabled, '<b>เปิดระบบอัตโนมัติ</b> (เริ่มทำงานตั้งแต่งวดที่ระบุด้านล่างเป็นต้นไป — ไม่ย้อนไปทำงวดเก่า)')+
       '<div class="field"><label>เริ่มตั้งแต่งวด (YYYYMM เช่น 202611)</label><input name="startPeriod" value="'+escapeHtml(a.startPeriod||'')+'" placeholder="เว้นว่าง = เดือนถัดไปเมื่อกดเปิด" inputmode="numeric" maxlength="6"></div>'+
-      '<h4 style="margin:14px 0 4px;">1. ออกบิลและส่งยอดเข้ากลุ่มห้อง (ทุกวันที่ 1)</h4>'+
-      chk('autoBilling', a.autoBilling, 'ออกใบแจ้งหนี้ให้ทุกห้องอัตโนมัติ เมื่อจดมิเตอร์น้ำ-ไฟครบทุกห้อง (ถ้าไม่ครบ แจ้งพนักงานเวลา 10:00 และ 17:00 และตั้งแต่วันที่ 3 จะออกบิลเฉพาะห้องที่จดแล้ว)')+
-      chk('sendToRooms', a.sendToRooms, 'ส่งใบแจ้งหนี้เข้ากลุ่มไลน์ของแต่ละห้องทันทีหลังออกบิล')+
+      '<h4 style="margin:14px 0 4px;">1. ออกใบแจ้งหนี้ (ส่งเข้ากลุ่มห้องด้วยมือหลังตรวจสอบเท่านั้น)</h4>'+
+      chk('autoBilling', a.autoBilling, 'ออกใบแจ้งหนี้ให้ทุกห้องอัตโนมัติ เมื่อจดมิเตอร์น้ำ-ไฟครบทุกห้อง (ถ้าไม่ครบ แจ้งพนักงานเวลา 10:00 และ 17:00 และตั้งแต่วันที่ 3 จะออกบิลเฉพาะห้องที่จดแล้ว) — <b>ระบบไม่ส่งบิลเข้ากลุ่มเอง</b> ADMIN/OWNER ตรวจแล้วกดส่งที่หน้า "ใบแจ้งหนี้" (ทีละห้อง หรือทั้งหอพัก)')+
       '<div class="field"><label>เริ่มทำงานตั้งแต่เวลา (ชั่วโมง 0–23 เวลาไทย)</label><input name="billingHour" type="number" min="0" max="23" value="'+a.billingHour+'"></div>'+
       '<div class="field"><label>ข้อมูลการชำระเงินที่แนบท้ายบิล (เลขบัญชี/พร้อมเพย์)</label><textarea name="payInfo" rows="3" maxlength="600" placeholder="เช่น ธ.กสิกรไทย 123-4-56789-0 ชื่อบัญชี …">'+escapeHtml(a.payInfo||'')+'</textarea></div>'+
       '<h4 style="margin:14px 0 4px;">2. ทวงถามยอดค้าง (วันที่ 5, วันที่ 8 แล้วซ้ำจนกว่าจะชำระครบ)</h4>'+
-      chk('reminders', a.reminders, 'ส่งข้อความทวงถามเข้ากลุ่มห้องที่ยังไม่ชำระ/ชำระไม่ครบ')+
+      chk('reminders', a.reminders, 'ส่งข้อความทวงถามเข้ากลุ่มห้องที่ยังไม่ชำระ/ชำระไม่ครบ (เฉพาะใบแจ้งหนี้ที่ส่งเข้ากลุ่มแล้ว)')+
       '<div class="field"><label>หลังวันที่ 8 ทวงซ้ำทุกกี่วัน (0 = ไม่ทวงซ้ำ)</label><input name="repeatEvery" type="number" min="0" max="30" value="'+a.repeatEvery+'"></div>'+
       '<div class="field"><label>ส่งทวงถามตั้งแต่เวลา (ชั่วโมง 0–23)</label><input name="remindHour" type="number" min="0" max="23" value="'+a.remindHour+'"></div>'+
-      '<h4 style="margin:14px 0 4px;">3. ตรวจสลิปโอนเงินในกลุ่ม และลงบัญชีให้อัตโนมัติ</h4>'+
-      chk('slipCheck', a.slipCheck, 'ลูกบ้านส่งรูปสลิปในกลุ่ม → ระบบตรวจสลิป → บันทึกรับชำระ + ออกเลขที่ใบเสร็จ → ตอบรับในกลุ่ม (ไม่ครบ/ไม่ถูกต้อง จะแจ้งทั้งลูกบ้านและกลุ่มพนักงาน)')+
+      '<h4 style="margin:14px 0 4px;">3. สลิปที่ลูกบ้านส่งในกลุ่ม (ADMIN/OWNER ตรวจยอดก่อนยืนยัน)</h4>'+
+      '<p class="hint" style="margin:0 0 6px;">ลูกบ้านส่งรูปสลิป → ระบบบันทึก "รอตรวจสอบ" + แจ้งกลุ่มพนักงาน + ตอบรับสั้นๆ ในกลุ่มห้อง → ADMIN/OWNER ตรวจยอดที่หน้า "การรับชำระเงิน" แล้วกดยืนยัน จึงบันทึกรับชำระและแจ้ง "ได้รับชำระเรียบร้อย" (ทำงานได้แม้ไม่ใส่ API key)</p>'+
+      chk('slipCheck', a.slipCheck, 'ให้ระบบอ่านสลิปช่วย (EasySlip) แสดงยอด/ผู้โอน และเตือนสลิปซ้ำ/เก่า/บัญชีผู้รับไม่ตรง — ไม่บันทึกรับชำระเอง (ต้องใส่ API key)')+
       '<div class="field"><label>API key บริการตรวจสลิป (EasySlip)</label><input name="slipKey" type="password" autocomplete="off" placeholder="'+(sl.hasApiKey?'บันทึกไว้แล้ว — เว้นว่างถ้าไม่เปลี่ยน':'สมัครที่ easyslip.com แล้ววาง API key')+'"></div>'+
       chk('matchAccount', sl.matchAccount, 'ตรวจว่าบัญชีผู้รับตรงกับบัญชีที่ผูกไว้ใน EasySlip')+
       '<div class="field"><label>ชื่อบัญชีผู้รับต้องมีคำว่า (ถ้าต้องการตรวจ)</label><input name="receiverContains" value="'+escapeHtml(sl.receiverContains||'')+'" maxlength="80"></div>'+
@@ -2491,7 +2726,6 @@ async function initAutoSettings(card){
     '<div class="tag-row" style="display:flex;gap:8px;flex-wrap:wrap;">'+
       '<button class="btn" id="autoDryBill">ทดลองออกบิลงวดนี้</button>'+
       '<button class="btn" id="autoDryRem">ทดลองทวงถาม</button>'+
-      '<button class="btn" id="autoRunBills">ส่งบิลที่ยังไม่ส่งเข้ากลุ่มทันที</button>'+
     '</div><pre id="autoOut" style="white-space:pre-wrap;font-size:12.5px;background:var(--surface-2,rgba(0,0,0,.04));padding:10px;border-radius:8px;margin-top:10px;display:none;"></pre>'+
     '<h4 style="margin:20px 0 6px;">กลุ่มไลน์ของแต่ละห้อง ('+linked+'/'+rooms.length+' ห้องผูกแล้ว)</h4>'+
     '<p class="hint" style="margin:0 0 8px;">เชิญบอทเข้ากลุ่มของห้อง แล้วตั้งชื่อกลุ่มให้มีรหัสห้อง (เช่น KM101, หอพลอย#1) ระบบจะผูกให้อัตโนมัติเมื่อบอทเข้ากลุ่ม หรือกด “จับคู่อัตโนมัติ” / เลือกเองในตาราง · พบกลุ่มแล้ว '+seenArr.length+' กลุ่ม</p>'+
@@ -2506,11 +2740,11 @@ async function initAutoSettings(card){
   form.addEventListener('submit', async e=>{
     e.preventDefault(); const fd = new FormData(form);
     const g = n=>fd.get(n)!==null;
-    const auto = { enabled:g('enabled'), startPeriod:(fd.get('startPeriod')||'').trim(), autoBilling:g('autoBilling'), sendToRooms:g('sendToRooms'),
+    const auto = { enabled:g('enabled'), startPeriod:(fd.get('startPeriod')||'').trim(), autoBilling:g('autoBilling'), sendToRooms:false,
       reminders:g('reminders'), slipCheck:g('slipCheck'), repeatEvery:fd.get('repeatEvery'), billingHour:fd.get('billingHour'), remindHour:fd.get('remindHour'),
       maxSlipAgeDays:fd.get('maxSlipAgeDays'), payInfo:fd.get('payInfo')||'',
       slip:{ apiKey:fd.get('slipKey')||'', matchAccount:g('matchAccount'), receiverContains:fd.get('receiverContains')||'' } };
-    if(auto.enabled && !a.enabled && !confirm('เปิดระบบอัตโนมัติ? ตั้งแต่วันที่ 1 ของงวดที่เริ่ม ระบบจะออกบิลและส่งข้อความเข้ากลุ่มลูกบ้านเองโดยไม่ถามซ้ำ')) return;
+    if(auto.enabled && !a.enabled && !confirm('เปิดระบบอัตโนมัติ? ตั้งแต่วันที่ 1 ของงวดที่เริ่ม ระบบจะออกใบแจ้งหนี้เอง (ไม่ส่งเข้ากลุ่มจนกว่า ADMIN/OWNER จะกดส่ง) และจะทวงถามเฉพาะบิลที่ส่งแล้วเองโดยไม่ถามซ้ำ')) return;
     try{
       const r = await lineCall('save_auto', {auto});
       await logAudit({action:'UPDATE_AUTOMATION', entityType:'config', entityId:'auto', newValue:{enabled:r.auto.enabled, startPeriod:r.auto.startPeriod, slipCheck:r.auto.slipCheck}});
@@ -2529,9 +2763,6 @@ async function initAutoSettings(card){
   $('#autoDryRem', card).addEventListener('click', e=>run(e.target, {task:'reminders', dry:true, kind:'D5'}, l=>{
     const r = l.reminders||{};
     return 'ทดลองทวงถาม (ไม่ส่งจริง)\nห้องที่ค้างและมีกลุ่มไลน์ จะส่งถึง: '+((r.sent||[]).join(', ')||'-')+'\nค้างแต่ไม่มีกลุ่มไลน์: '+((r.noGroup||[]).join(', ')||'-')+'\nยอดค้างรวม '+Number(r.total||0).toLocaleString('th-TH')+' บาท'; }));
-  $('#autoRunBills', card).addEventListener('click', e=>run(e.target, {task:'bills'}, l=>
-    'ส่งบิลเข้ากลุ่มแล้ว: '+((l.billsSent||[]).join(', ')||'-')+'\nยังไม่ได้ส่ง (ไม่มีกลุ่ม/ส่งไม่สำเร็จ): '+((l.billsNoGroup||[]).join(', ')||'-'),
-    'ส่งใบแจ้งหนี้ที่ยังไม่เคยส่งของงวดนี้เข้ากลุ่มไลน์ลูกบ้านจริงตอนนี้?'));
   $('#autoRematch', card).addEventListener('click', async e=>{
     e.target.disabled = true;
     try{ const r = await lineCall('rematch'); toast('จับคู่เพิ่ม '+r.added+' ห้อง','ok'); initAutoSettings(card); }catch(err){ toast(err.message,'err'); e.target.disabled=false; }
@@ -2602,6 +2833,76 @@ function openReceiptInfoModal(payment){
     (payment.slipDataUrl? '<div class="field"><label>หลักฐานการชำระเงิน</label><img class="photo-thumb" data-zoom="'+payment.slipDataUrl+'" src="'+payment.slipDataUrl+'" style="width:120px;height:120px;"></div>':'')});
   $all('[data-zoom]', modalEl).forEach(img=>img.addEventListener('click', ()=>lightbox(img.dataset.zoom)));
 }
+
+/* ---- tenant slips posted in room LINE groups: parked as "pending" until ADMIN/OWNER confirms the amount ---- */
+const SlipUi = { status:'pending' };
+const openInvoicesOf = roomId => cache.invoices.filter(i=>i.roomId===roomId && ['unpaid','partial'].includes(i.status))
+  .map(i=>({inv:i, rem: Math.max(0, Math.round((Number(i.total) - cache.payments.filter(p=>p.invoiceId===i.id && p.status==='active').reduce((s,p)=>s+Number(p.amount||0),0))*100)/100)}))
+  .filter(x=>x.rem>0).sort((a,b)=>a.inv.period<b.inv.period?-1:1);
+async function renderSlipPanel(){
+  const host = $('#slipPanel'); if(!host) return;
+  if(!can('REVIEW_SLIP')){
+    host.innerHTML = '<div class="help-box">สลิปที่ลูกบ้านส่งในกลุ่มไลน์ ADMIN หรือเจ้าของกิจการเป็นผู้ตรวจยอดและยืนยันรับชำระ</div>'; return;
+  }
+  host.innerHTML = '<div class="card"><div class="card-head"><h3>สลิปรอตรวจสอบ</h3></div><p class="hint" style="padding:0 16px 14px;">กำลังโหลด…</p></div>';
+  let slips = [];
+  try{ slips = (await lineCall('slip_list', {status: SlipUi.status})).slips || []; }
+  catch(e){ host.innerHTML = '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);">โหลดรายการสลิปไม่ได้: '+escapeHtml(e.message)+'</div>'; return; }
+  if(!$('#slipPanel')) return;
+  const stPill = {pending:'<span class="pill warn">รอตรวจสอบ</span>', approved:'<span class="pill ok">ยืนยันแล้ว</span>', rejected:'<span class="pill bad">ปฏิเสธ</span>'};
+  host.innerHTML = '<div class="card"><div class="card-head"><div><h3>สลิปรอตรวจสอบ '+(SlipUi.status==='pending' ? '<span class="pill '+(slips.length?'warn':'ok')+'">'+slips.length+'</span>' : '')+'</h3>'+
+    '<div class="desc">ลูกบ้านส่งรูปสลิปในกลุ่มห้อง → ระบบบันทึกไว้รอตรวจ · ตรวจยอดเงินที่เข้าบัญชีให้ตรงก่อน แล้วกดยืนยัน ระบบจึงบันทึกรับชำระ ออกใบเสร็จ และแจ้ง "ได้รับชำระเรียบร้อย" เข้ากลุ่มห้อง</div></div>'+
+    '<div class="tag-row"><select id="slipStSel" class="btn sm"><option value="pending"'+(SlipUi.status==='pending'?' selected':'')+'>รอตรวจสอบ</option><option value="approved"'+(SlipUi.status==='approved'?' selected':'')+'>ยืนยันแล้ว</option><option value="rejected"'+(SlipUi.status==='rejected'?' selected':'')+'>ปฏิเสธแล้ว</option></select></div></div>'+
+    (slips.length ? '<div class="tbl-wrap"><table class="grid"><thead><tr><th>ห้อง</th><th>เวลาที่ส่ง</th><th>ยอดในสลิป (ระบบอ่าน)</th><th>ยอดค้าง</th><th>ข้อสังเกต</th><th>สถานะ</th><th></th></tr></thead><tbody>'+
+      slips.map(sl=>{
+        const owed = openInvoicesOf(sl.roomId).reduce((s,x)=>s+x.rem,0);
+        return '<tr><td><b>'+escapeHtml(sl.roomCode)+'</b></td><td>'+fmtDateTime(sl.createdAt)+'</td><td class="num">'+(sl.suggestedAmount? money(sl.suggestedAmount):'<span class="pill muted">ไม่ทราบ — ดูจากรูป</span>')+'</td><td class="num">'+money(owed)+'</td>'+
+          '<td style="font-size:12px;">'+((sl.flags||[]).map(f=>'<div style="color:var(--danger);">⚠ '+escapeHtml(f)+'</div>').join('') || '-')+(sl.status==='approved'?'<div>ยืนยัน '+money(sl.approvedAmount)+' โดย '+escapeHtml(sl.approvedByName||'')+' · '+escapeHtml((sl.receipts||[]).join(', '))+'</div>':'')+(sl.status==='rejected'?'<div>'+escapeHtml(sl.rejectReason||'')+' · '+escapeHtml(sl.rejectedByName||'')+'</div>':'')+'</td>'+
+          '<td>'+stPill[sl.status]+'</td><td style="text-align:right;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">ตรวจสลิป</button>':'')+'</td></tr>';
+      }).join('')+'</tbody></table></div>' : '<div class="empty-row" style="padding:18px;">'+(SlipUi.status==='pending'?'ไม่มีสลิปรอตรวจสอบ':'ไม่มีรายการ')+'</div>')+'</div>';
+  $('#slipStSel', host).addEventListener('change', e=>{ SlipUi.status = e.target.value; renderSlipPanel(); });
+  $all('[data-slip]', host).forEach(b=>b.addEventListener('click', ()=>openSlipReviewModal(slips.find(x=>x.id===b.dataset.slip))));
+}
+async function openSlipReviewModal(sl){
+  const open = openInvoicesOf(sl.roomId);
+  const owed = open.reduce((s,x)=>s+x.rem,0);
+  const back = openModal({title:'ตรวจสลิป — ห้อง '+sl.roomCode, wide:true, submitLabel:'ยืนยันยอด และแจ้งรับชำระในกลุ่ม', onSubmit: async fd=>{
+    const amount = Number(fd.get('amount'));
+    if(!(amount>0)) throw new Error('กรอกยอดเงินที่ตรวจสอบแล้ว');
+    if(!fd.get('checked')) throw new Error('ติ๊กยืนยันว่าตรวจยอดเงินเข้าบัญชีแล้ว');
+    const r = await lineCall('slip_approve', {slipId: sl.id, amount, invoiceId: fd.get('invoiceId')||undefined});
+    await logAudit({action:'APPROVE_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, amount, receipts:r.receipts, notified:r.notified}});
+    toast('บันทึกรับชำระ '+money(amount)+' บาท ห้อง '+sl.roomCode+' แล้ว'+(r.notified?' · แจ้งในกลุ่มห้องแล้ว':' · แต่ส่งข้อความเข้ากลุ่มไม่สำเร็จ'+(r.notifyError?' ('+r.notifyError+')':'')), r.notified?'ok':'warn');
+    renderSlipPanel();
+  }, bodyHtml:
+    '<div class="help-box">ตรวจยอดเงินในสลิปให้ตรงกับที่เข้าบัญชีก่อน เมื่อยืนยัน ระบบจะบันทึกรับชำระ ออกเลขที่ใบเสร็จ และส่งข้อความ "ได้รับชำระเงินเรียบร้อย" เข้ากลุ่มห้อง</div>'+
+    ((sl.flags||[]).length ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);color:var(--danger);">'+sl.flags.map(f=>'⚠ '+escapeHtml(f)).join('<br>')+'</div>' : '')+
+    '<div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start;">'+
+      '<div id="slipImgBox" style="min-height:120px;text-align:center;"><p class="hint">กำลังโหลดรูปสลิป…</p></div>'+
+      '<div>'+
+        '<p style="margin:0 0 6px;font-size:13px;">ยอดค้างชำระห้อง '+escapeHtml(sl.roomCode)+': <b>'+money(owed)+'</b> บาท</p>'+
+        open.map(x=>'<div style="font-size:12.5px;color:var(--text-muted);">'+escapeHtml(x.inv.invoiceNumber||'')+' · '+periodLabel(x.inv.period)+' · ค้าง '+money(x.rem)+'</div>').join('')+
+        (sl.verify && !sl.verify.error ? '<p style="margin:10px 0 0;font-size:12.5px;">ระบบอ่านสลิป: '+money(sl.verify.amount)+' บาท · ผู้โอน '+escapeHtml(sl.verify.sender||'-')+' → '+escapeHtml(sl.verify.receiver||'-')+' · อ้างอิง '+escapeHtml(sl.verify.transRef||'-')+'</p>' : '')+
+        '<div class="field" style="margin-top:12px;"><label>ยอดเงินที่ตรวจสอบแล้ว (บาท)</label><input name="amount" type="number" step="0.01" min="0" required value="'+(sl.suggestedAmount||'')+'"></div>'+
+        (open.length>1 ? '<div class="field"><label>ตัดชำระใบแจ้งหนี้</label><select name="invoiceId"><option value="">เรียงจากงวดเก่าสุดก่อน (แนะนำ)</option>'+open.map(x=>'<option value="'+x.inv.id+'">'+periodLabel(x.inv.period)+' · ค้าง '+money(x.rem)+'</option>').join('')+'</select></div>' : '')+
+        '<label style="display:flex;gap:8px;align-items:center;font-weight:400;margin:6px 0;"><input type="checkbox" name="checked" style="width:auto;"> ฉันตรวจยอดเงินเข้าบัญชีแล้ว ตรงกับสลิป</label>'+
+        '<button type="button" class="btn sm" id="slipRejectBtn" style="margin-top:8px;">ปฏิเสธสลิปนี้</button>'+
+      '</div></div>'});
+  lineCall('slip_image', {slipId: sl.id}).then(r=>{
+    const box = $('#slipImgBox', back); if(!box) return;
+    box.innerHTML = r.dataUrl ? '<img src="'+r.dataUrl+'" style="max-width:100%;max-height:60vh;border-radius:8px;cursor:zoom-in;" id="slipImg">' : '<p class="hint">ไม่มีรูปสลิปที่เก็บไว้ (ไฟล์ใหญ่เกินไป) — ดูรูปในกลุ่มไลน์</p>';
+    const im = $('#slipImg', back); if(im) im.addEventListener('click', ()=>lightbox(r.dataUrl));
+  }).catch(e=>{ const box = $('#slipImgBox', back); if(box) box.innerHTML = '<p class="hint" style="color:var(--danger);">โหลดรูปไม่ได้: '+escapeHtml(e.message)+'</p>'; });
+  $('#slipRejectBtn', back).addEventListener('click', ()=>{
+    openModal({title:'ปฏิเสธสลิป — ห้อง '+sl.roomCode, submitLabel:'ปฏิเสธสลิป', onSubmit: async fd=>{
+      const r = await lineCall('slip_reject', {slipId: sl.id, reason: fd.get('reason')||'', notify: fd.get('notify')==='on'});
+      await logAudit({action:'REJECT_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, reason: fd.get('reason')||''}});
+      toast('ปฏิเสธสลิปแล้ว'+(r.notified?' · แจ้งในกลุ่มห้องแล้ว':''),'ok'); back.remove(); renderSlipPanel();
+    }, bodyHtml:'<div class="field"><label>เหตุผล (เช่น ยอดไม่ตรง / ไม่ใช่สลิป / ยังไม่เห็นยอดเข้าบัญชี)</label><textarea name="reason" required></textarea></div>'+
+      '<label style="display:flex;gap:8px;align-items:center;font-weight:400;"><input type="checkbox" name="notify" style="width:auto;" checked> แจ้งในกลุ่มห้องให้ส่งสลิปใหม่</label>'});
+  });
+}
+
 function renderPayments(root){
   const scopedRoomIds = new Set(scopedRooms().map(r=>r.id));
   const roomStatus = computeRoomPaymentStatus();
@@ -2618,6 +2919,7 @@ function renderPayments(root){
   roomStatus.forEach(rs=>counts[rs.status]++);
   root.innerHTML =
     '<div class="section-title"><div><h2>การรับชำระเงิน &amp; ใบเสร็จ</h2><div class="desc">ออกใบเสร็จได้ต่อเมื่อแนบหลักฐานการชำระเงินแล้วเท่านั้น เลขที่รันต่อเนื่องโดยระบบ ห้ามลบ — ผิดพลาดต้อง VOID แล้วรับชำระใหม่แทน</div></div></div>'+
+    '<div id="slipPanel"></div>'+
     '<div class="card"><div class="card-head"><div><h3>สถานะการชำระเงินรายห้อง — งวด '+periodLabel(currentPeriod())+'</h3>'+
       '<div class="desc">เรียงตามรหัสหอพัก แล้วเลขห้อง — เขียว: ชำระแล้ว · เหลือง: ยังไม่ถึงกำหนด (ไม่เกินวันที่ 5) · แดง: ค้างชำระเกินวันที่ 5</div></div>'+
       '<div class="tag-row"><span class="pill ok">ชำระแล้ว '+counts.PAID+'</span><span class="pill warn">รอครบกำหนด '+counts.DUE+'</span><span class="pill bad">ค้างเกินกำหนด '+counts.OVERDUE+'</span></div>'+
@@ -2628,6 +2930,7 @@ function renderPayments(root){
       '<th>เลขที่ใบเสร็จ</th><th>ห้อง</th><th>จำนวนเงิน</th><th>ช่องทาง</th><th>หลักฐาน</th><th>ผู้รับเงิน</th><th>วัน-เวลา</th><th>สถานะ</th><th></th>'+
     '</tr></thead><tbody id="payBody"></tbody></table></div></div>';
 
+  renderSlipPanel();
   const grid = $('#roomStatusGrid');
   const multiProp = activeProperties().length>1;
   const stClass = {PAID:'st-ok', DUE:'st-warn', OVERDUE:'st-bad', WAIVED:'st-muted', NONE:'st-muted'};
