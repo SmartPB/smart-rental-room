@@ -1164,18 +1164,7 @@ function computeAlerts(){
     });
   });
 
-  // 2) Missing meter photos (current period)
-  rooms.forEach(r=>{
-    ['water','elec'].forEach(type=>{
-      const cur = readingFor(r.id, type, period);
-      if(cur && !cur.photoDataUrl){
-        alerts.push({sev:'warn', type:'ไม่มีรูปมิเตอร์ประกอบ', room:r.code, propertyId:r.propertyId,
-          title:'ไม่มีรูปมิเตอร์ประกอบ: '+r.code+' ('+METER_TYPE_LABEL[type]+')',
-          detail:'บันทึกโดย '+cur.recordedByName+' เมื่อ '+fmtDateTime(cur.timestamp),
-          ref:{kind:'meterReading', id:cur.id}, points:10, target:{type:'staff', id:cur.recordedBy, label:cur.recordedByName}});
-      }
-    });
-  });
+  // (meter photos are optional — no alert for a missing photo)
 
   // 2b) Monthly meter reading not recorded (every room, vacant or not)
   if(new Date().getDate() >= 3){
@@ -2208,7 +2197,7 @@ function renderMeters(root){
   const props = activeProperties();
   if(selectedPropertyId!=='ALL' && !props.some(p=>p.id===selectedPropertyId)) selectedPropertyId='ALL';
   root.innerHTML =
-    '<div class="section-title"><div><h2>มิเตอร์น้ำ-ไฟ</h2><div class="desc">ต้องมีหลักฐานรูปถ่ายทุกครั้ง ครอบคลุมห้องว่างและปิดซ่อมบำรุงด้วย (รวมถึงห้องที่คิดค่าน้ำ-ไฟรวมในค่าเช่า เพื่อตรวจจับการทุจริต) · แก้ไขหลังออกบิลต้องระบุเหตุผล</div></div>'+
+    '<div class="section-title"><div><h2>มิเตอร์น้ำ-ไฟ</h2><div class="desc">จดค่ามิเตอร์ทุกห้อง รวมห้องว่างและปิดซ่อมบำรุง (รวมถึงห้องที่คิดค่าน้ำ-ไฟรวมในค่าเช่า) · แนบรูปถ่ายหรือไม่ก็ได้ · แก้ไขหลังออกบิลต้องระบุเหตุผล</div></div>'+
       '<div class="tag-row">'+
       (props.length>1? '<select id="meterPropSel" class="btn sm"><option value="ALL" '+(selectedPropertyId==='ALL'?'selected':'')+'>ทุกหอพัก</option>'+
         props.map(p=>'<option value="'+p.id+'" '+(p.id===selectedPropertyId?'selected':'')+'>'+escapeHtml(p.name)+' ('+p.code+')</option>').join('')+'</select>' : '')+
@@ -2258,7 +2247,7 @@ function meterTypeBlockHtml(room, type){
       '<div class="mf"><span class="mf-label">ค่าก่อนหน้า</span><span class="mf-value">'+prevVal+'</span>'+prevCap+'</div>'+
       '<div class="mf"><span class="mf-label">ค่าปัจจุบัน</span><span class="mf-value">'+(rd? rd.value : '-')+'</span></div>'+
       '<div class="mf"><span class="mf-label">ใช้ไป</span><span class="mf-value">'+(rd? rd.usage : '-')+'</span></div>'+
-      '<div class="mf"><span class="mf-label">รูปถ่าย</span>'+(rd && rd.photoDataUrl ? '<img class="photo-thumb" data-zoom="'+rd.photoDataUrl+'" src="'+rd.photoDataUrl+'">' : (rd? '<span class="pill bad">ไม่มีรูป</span>':'<span class="pill muted">-</span>'))+'</div>'+
+      '<div class="mf"><span class="mf-label">รูปถ่าย</span>'+(rd && rd.photoDataUrl ? '<img class="photo-thumb" data-zoom="'+rd.photoDataUrl+'" src="'+rd.photoDataUrl+'">' : (rd? '<span class="pill muted">ไม่มีรูป</span>':'<span class="pill muted">-</span>'))+'</div>'+
     '</div>'+
     '<div class="meter-actions">'+
       (can('RECORD_METER') && (!rd || !rd.locked) ? '<button class="btn sm" data-record="'+room.id+'|'+type+'">'+(rd?'แก้ไข':icon('camera')+' ถ่ายรูป / จดมิเตอร์')+'</button>' : '')+
@@ -2329,8 +2318,8 @@ function openMeterModal(room, type, existing){
     ((type==='water'&&roomWaterMode(room)==='FLAT')? '<div class="help-box">ห้องนี้คิดค่าน้ำแบบเหมาจ่าย ('+money(roomWaterFlatFee(room))+' บาท/เดือน) ยังคงต้องจดมิเตอร์เพื่อใช้ตรวจจับความผิดปกติ แม้จะไม่มีผลต่อยอดบิล</div>':'')+
     '<div class="field"><label>ค่ามิเตอร์ก่อนหน้า</label><input value="'+(existing? existing.previousValue : (latestReadingFor(room.id,type,meterPeriodSel)? latestReadingFor(room.id,type,meterPeriodSel).value : 0))+'" disabled></div>'+
     '<div class="field"><label>ค่ามิเตอร์ปัจจุบัน</label><input name="value" id="meterValueInput" type="number" required value="'+(existing? existing.value:'')+'"></div>'+
-    '<div class="field"><label>รูปถ่ายมิเตอร์ '+(existing&&existing.photoDataUrl?'(มีรูปอยู่แล้ว — เลือกใหม่เพื่อแทนที่)':'(บังคับ)')+'</label>'+
-    '<input name="photo" id="meterPhotoInput" type="file" accept="image/*" capture="environment" '+(existing&&existing.photoDataUrl?'':'required')+'>'+
+    '<div class="field"><label>รูปถ่ายมิเตอร์ '+(existing&&existing.photoDataUrl?'(มีรูปอยู่แล้ว — เลือกใหม่เพื่อแทนที่)':'(ไม่บังคับ)')+'</label>'+
+    '<input name="photo" id="meterPhotoInput" type="file" accept="image/*" capture="environment">'+
     '<div id="ocrAssistWrap" style="margin-top:8px;"></div>'+
     '<p class="hint">'+icon('camera')+' รองรับถ่ายภาพจากกล้องมือถือโดยตรง ระบบจะบีบอัดไฟล์อัตโนมัติ</p></div>'});
 
