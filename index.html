@@ -2586,7 +2586,7 @@ async function openLineNotifyModal({invoices, period}){
   const single = !!(invoices && invoices.length===1);
   const ready = await lineStatus();
   const scopeIds = new Set(scopedRooms().map(r=>r.id));
-  const periods = pastPeriods(billPeriodNow(),3).slice().reverse();
+  const periods = pastPeriods(nextPeriod(billPeriodNow()),4).slice().reverse();
   const startPeriod = period || (single? invoices[0].period : billPeriodNow());
   const getInvs = p => single ? invoices : cache.invoices.filter(i=>i.period===p && i.status!=='cancelled' && scopeIds.has(i.roomId));
   const initial = getInvs(startPeriod);
@@ -2797,7 +2797,7 @@ async function initAutoSettings(card){
 function openInvoiceModal(){
   const eligible = scopedRooms().filter(r=>activeLeaseFor(r.id));
   if(!eligible.length){ toast('ยังไม่มีห้องที่มีสัญญาผู้เช่าที่ใช้งานอยู่ในขอบเขตที่เลือก','err'); return; }
-  const periods = pastPeriods(billPeriodNow(),3);
+  const periods = pastPeriods(nextPeriod(billPeriodNow()),4);
   openModal({title:'ออกใบแจ้งหนี้', onSubmit: async fd=>{
     const roomId = fd.get('roomId'); const room = roomById(roomId);
     await generateInvoice({roomId, roomCode:room.code, period:fd.get('period'), discount:fd.get('discount'), discountReason:fd.get('discountReason')});
@@ -2873,7 +2873,8 @@ async function renderSlipPanelAt(sel){
   try{ slips = (await lineCall('slip_list', {status: SlipUi.status})).slips || []; }
   catch(e){ host.innerHTML = '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);">โหลดรายการสลิปไม่ได้: '+escapeHtml(e.message)+'</div>'; return; }
   if(!$(sel)) return;
-  if(SlipUi.status==='pending'){ SlipUi.pendingCount = slips.length; updateApprovalBadge(); }
+  slips.sort((x,y)=>(x.notSlip?1:0)-(y.notSlip?1:0));  // images the checker could not read as a slip go last
+  if(SlipUi.status==='pending'){ SlipUi.pendingCount = slips.filter(x=>!x.notSlip).length; updateApprovalBadge(); }
   const stPill = {pending:'<span class="pill warn">รอตรวจสอบ</span>', approved:'<span class="pill ok">ยืนยันแล้ว</span>', rejected:'<span class="pill bad">ยกเลิก</span>'};
   host.innerHTML = '<div class="card"><div class="card-head"><div><h3>สลิปรอตรวจสอบ '+(SlipUi.status==='pending' ? '<span class="pill '+(slips.length?'warn':'ok')+'">'+slips.length+'</span>' : '')+'</h3>'+
     '<div class="desc">ลูกบ้านส่งรูปสลิปในกลุ่มห้อง → ระบบบันทึกไว้รอตรวจ · ตรวจยอดเงินที่เข้าบัญชีให้ตรงก่อน แล้วกดยืนยัน ระบบจึงบันทึกรับชำระ ออกใบเสร็จ และแจ้ง "ได้รับชำระเรียบร้อย" เข้ากลุ่มห้อง</div></div>'+
@@ -2881,7 +2882,7 @@ async function renderSlipPanelAt(sel){
     (slips.length ? '<div class="tbl-wrap"><table class="grid"><thead><tr><th>ห้อง</th><th>เวลาที่ส่ง</th><th>ยอดในสลิป (ระบบอ่าน)</th><th>ยอดค้าง</th><th>ข้อสังเกต</th><th>สถานะ</th><th></th></tr></thead><tbody>'+
       slips.map(sl=>{
         const owed = openInvoicesOf(sl.roomId).reduce((s,x)=>s+x.rem,0);
-        return '<tr><td><b>'+escapeHtml(sl.roomCode)+'</b></td><td>'+fmtDateTime(sl.createdAt)+'</td><td class="num">'+(sl.suggestedAmount? money(sl.suggestedAmount):'<span class="pill muted">ไม่ทราบ — ดูจากรูป</span>')+'</td><td class="num">'+money(owed)+'</td>'+
+        return '<tr'+(sl.notSlip?' style="opacity:.6;"':'')+'><td><b>'+escapeHtml(sl.roomCode)+'</b>'+(sl.notSlip?'<div><span class="pill muted">อาจไม่ใช่สลิป</span></div>':'')+'</td><td>'+fmtDateTime(sl.createdAt)+'</td><td class="num">'+(sl.suggestedAmount? money(sl.suggestedAmount):'<span class="pill muted">ไม่ทราบ — ดูจากรูป</span>')+'</td><td class="num">'+money(owed)+'</td>'+
           '<td style="font-size:12px;">'+((sl.flags||[]).map(f=>'<div style="color:var(--danger);">⚠ '+escapeHtml(f)+'</div>').join('') || '-')+(sl.status==='approved'?'<div>ยืนยัน '+money(sl.approvedAmount)+' โดย '+escapeHtml(sl.approvedByName||'')+' · '+escapeHtml((sl.receipts||[]).join(', '))+'</div>':'')+(sl.status==='rejected'?'<div>'+escapeHtml(sl.rejectReason||'')+' · '+escapeHtml(sl.rejectedByName||'')+'</div>':'')+'</td>'+
           '<td>'+stPill[sl.status]+'</td><td style="text-align:right;white-space:nowrap;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">อนุมัติ</button> <button class="btn sm danger" data-slipcancel="'+sl.id+'">ยกเลิก</button>':'')+'</td></tr>';
       }).join('')+'</tbody></table></div>' : '<div class="empty-row" style="padding:18px;">'+(SlipUi.status==='pending'?'ไม่มีสลิปรอตรวจสอบ':'ไม่มีรายการ')+'</div>')+'</div>';
