@@ -1507,7 +1507,7 @@ function renderLogin(){
 
 function renderShell(){
   const r = currentRoute();
-  const approvalsForMe = pendingApprovalsForMe().length;
+  const approvalsForMe = pendingApprovalsForMe().length + (can('REVIEW_SLIP') ? (SlipUi.pendingCount||0) : 0);
   const props = activeProperties();
   if(selectedPropertyId!=='ALL' && !props.some(p=>p.id===selectedPropertyId)) selectedPropertyId='ALL';
   const app = document.getElementById('app');
@@ -1543,6 +1543,10 @@ function renderShell(){
     payments: renderPayments, repairs: renderRepairs, expenses: renderExpenses, approvals: renderApprovals,
     audit: renderAudit, settings: renderSettings };
   (renderers[r] || renderDashboard)(content);
+  if(can('REVIEW_SLIP') && !SlipUi.countLoaded){
+    SlipUi.countLoaded = true;
+    lineCall('slip_list',{status:'pending'}).then(x=>{ SlipUi.pendingCount = (x.slips||[]).length; updateApprovalBadge(); }).catch(()=>{ SlipUi.countLoaded = false; });
+  }
 }
 
 /* ============================================================
@@ -2835,12 +2839,24 @@ function openReceiptInfoModal(payment){
 }
 
 /* ---- tenant slips posted in room LINE groups: parked as "pending" until ADMIN/OWNER confirms the amount ---- */
-const SlipUi = { status:'pending' };
+const SlipUi = { status:'pending', pendingCount:0 };
+function updateApprovalBadge(){
+  const btn = document.querySelector('.nav-item[data-route="approvals"]'); if(!btn) return;
+  const n = pendingApprovalsForMe().length + (can('REVIEW_SLIP') ? (SlipUi.pendingCount||0) : 0);
+  let b = btn.querySelector('.nav-badge');
+  if(n>0){ if(!b){ b = document.createElement('span'); b.className='nav-badge'; btn.appendChild(b); } b.textContent = n; }
+  else if(b) b.remove();
+}
 const openInvoicesOf = roomId => cache.invoices.filter(i=>i.roomId===roomId && ['unpaid','partial'].includes(i.status))
   .map(i=>({inv:i, rem: Math.max(0, Math.round((Number(i.total) - cache.payments.filter(p=>p.invoiceId===i.id && p.status==='active').reduce((s,p)=>s+Number(p.amount||0),0))*100)/100)}))
   .filter(x=>x.rem>0).sort((a,b)=>a.inv.period<b.inv.period?-1:1);
 async function renderSlipPanel(){
-  const host = $('#slipPanel'); if(!host) return;
+  const hosts = ['#slipPanel','#slipPanelAppr'].filter(h=>$(h));
+  for(const h of hosts) await renderSlipPanelAt(h);
+}
+async function renderSlipPanelAt(sel){
+  const host = $(sel); if(!host) return;
+  const inAppr = sel==='#slipPanelAppr';
   if(!can('REVIEW_SLIP')){
     host.innerHTML = '<div class="help-box">สลิปที่ลูกบ้านส่งในกลุ่มไลน์ ADMIN หรือเจ้าของกิจการเป็นผู้ตรวจยอดและยืนยันรับชำระ</div>'; return;
   }
@@ -2848,20 +2864,22 @@ async function renderSlipPanel(){
   let slips = [];
   try{ slips = (await lineCall('slip_list', {status: SlipUi.status})).slips || []; }
   catch(e){ host.innerHTML = '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);">โหลดรายการสลิปไม่ได้: '+escapeHtml(e.message)+'</div>'; return; }
-  if(!$('#slipPanel')) return;
-  const stPill = {pending:'<span class="pill warn">รอตรวจสอบ</span>', approved:'<span class="pill ok">ยืนยันแล้ว</span>', rejected:'<span class="pill bad">ปฏิเสธ</span>'};
+  if(!$(sel)) return;
+  if(SlipUi.status==='pending'){ SlipUi.pendingCount = slips.length; updateApprovalBadge(); }
+  const stPill = {pending:'<span class="pill warn">รอตรวจสอบ</span>', approved:'<span class="pill ok">ยืนยันแล้ว</span>', rejected:'<span class="pill bad">ยกเลิก</span>'};
   host.innerHTML = '<div class="card"><div class="card-head"><div><h3>สลิปรอตรวจสอบ '+(SlipUi.status==='pending' ? '<span class="pill '+(slips.length?'warn':'ok')+'">'+slips.length+'</span>' : '')+'</h3>'+
     '<div class="desc">ลูกบ้านส่งรูปสลิปในกลุ่มห้อง → ระบบบันทึกไว้รอตรวจ · ตรวจยอดเงินที่เข้าบัญชีให้ตรงก่อน แล้วกดยืนยัน ระบบจึงบันทึกรับชำระ ออกใบเสร็จ และแจ้ง "ได้รับชำระเรียบร้อย" เข้ากลุ่มห้อง</div></div>'+
-    '<div class="tag-row"><select id="slipStSel" class="btn sm"><option value="pending"'+(SlipUi.status==='pending'?' selected':'')+'>รอตรวจสอบ</option><option value="approved"'+(SlipUi.status==='approved'?' selected':'')+'>ยืนยันแล้ว</option><option value="rejected"'+(SlipUi.status==='rejected'?' selected':'')+'>ปฏิเสธแล้ว</option></select></div></div>'+
+    '<div class="tag-row"><select id="slipStSel" class="btn sm"><option value="pending"'+(SlipUi.status==='pending'?' selected':'')+'>รอตรวจสอบ</option><option value="approved"'+(SlipUi.status==='approved'?' selected':'')+'>ยืนยันแล้ว</option><option value="rejected"'+(SlipUi.status==='rejected'?' selected':'')+'>ยกเลิกแล้ว</option></select></div></div>'+
     (slips.length ? '<div class="tbl-wrap"><table class="grid"><thead><tr><th>ห้อง</th><th>เวลาที่ส่ง</th><th>ยอดในสลิป (ระบบอ่าน)</th><th>ยอดค้าง</th><th>ข้อสังเกต</th><th>สถานะ</th><th></th></tr></thead><tbody>'+
       slips.map(sl=>{
         const owed = openInvoicesOf(sl.roomId).reduce((s,x)=>s+x.rem,0);
         return '<tr><td><b>'+escapeHtml(sl.roomCode)+'</b></td><td>'+fmtDateTime(sl.createdAt)+'</td><td class="num">'+(sl.suggestedAmount? money(sl.suggestedAmount):'<span class="pill muted">ไม่ทราบ — ดูจากรูป</span>')+'</td><td class="num">'+money(owed)+'</td>'+
           '<td style="font-size:12px;">'+((sl.flags||[]).map(f=>'<div style="color:var(--danger);">⚠ '+escapeHtml(f)+'</div>').join('') || '-')+(sl.status==='approved'?'<div>ยืนยัน '+money(sl.approvedAmount)+' โดย '+escapeHtml(sl.approvedByName||'')+' · '+escapeHtml((sl.receipts||[]).join(', '))+'</div>':'')+(sl.status==='rejected'?'<div>'+escapeHtml(sl.rejectReason||'')+' · '+escapeHtml(sl.rejectedByName||'')+'</div>':'')+'</td>'+
-          '<td>'+stPill[sl.status]+'</td><td style="text-align:right;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">ตรวจสลิป</button>':'')+'</td></tr>';
+          '<td>'+stPill[sl.status]+'</td><td style="text-align:right;white-space:nowrap;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">อนุมัติ</button> <button class="btn sm danger" data-slipcancel="'+sl.id+'">ยกเลิก</button>':'')+'</td></tr>';
       }).join('')+'</tbody></table></div>' : '<div class="empty-row" style="padding:18px;">'+(SlipUi.status==='pending'?'ไม่มีสลิปรอตรวจสอบ':'ไม่มีรายการ')+'</div>')+'</div>';
   $('#slipStSel', host).addEventListener('change', e=>{ SlipUi.status = e.target.value; renderSlipPanel(); });
   $all('[data-slip]', host).forEach(b=>b.addEventListener('click', ()=>openSlipReviewModal(slips.find(x=>x.id===b.dataset.slip))));
+  $all('[data-slipcancel]', host).forEach(b=>b.addEventListener('click', ()=>openSlipRejectModal(slips.find(x=>x.id===b.dataset.slipcancel))));
 }
 async function openSlipReviewModal(sl){
   const open = openInvoicesOf(sl.roomId);
@@ -2886,21 +2904,22 @@ async function openSlipReviewModal(sl){
         '<div class="field" style="margin-top:12px;"><label>ยอดเงินที่ตรวจสอบแล้ว (บาท)</label><input name="amount" type="number" step="0.01" min="0" required value="'+(sl.suggestedAmount||'')+'"></div>'+
         (open.length>1 ? '<div class="field"><label>ตัดชำระใบแจ้งหนี้</label><select name="invoiceId"><option value="">เรียงจากงวดเก่าสุดก่อน (แนะนำ)</option>'+open.map(x=>'<option value="'+x.inv.id+'">'+periodLabel(x.inv.period)+' · ค้าง '+money(x.rem)+'</option>').join('')+'</select></div>' : '')+
         '<label style="display:flex;gap:8px;align-items:center;font-weight:400;margin:6px 0;"><input type="checkbox" name="checked" style="width:auto;"> ฉันตรวจยอดเงินเข้าบัญชีแล้ว ตรงกับสลิป</label>'+
-        '<button type="button" class="btn sm" id="slipRejectBtn" style="margin-top:8px;">ปฏิเสธสลิปนี้</button>'+
+        '<button type="button" class="btn sm danger" id="slipRejectBtn" style="margin-top:8px;">ยกเลิกสลิปนี้</button>'+
       '</div></div>'});
   lineCall('slip_image', {slipId: sl.id}).then(r=>{
     const box = $('#slipImgBox', back); if(!box) return;
     box.innerHTML = r.dataUrl ? '<img src="'+r.dataUrl+'" style="max-width:100%;max-height:60vh;border-radius:8px;cursor:zoom-in;" id="slipImg">' : '<p class="hint">ไม่มีรูปสลิปที่เก็บไว้ (ไฟล์ใหญ่เกินไป) — ดูรูปในกลุ่มไลน์</p>';
     const im = $('#slipImg', back); if(im) im.addEventListener('click', ()=>lightbox(r.dataUrl));
   }).catch(e=>{ const box = $('#slipImgBox', back); if(box) box.innerHTML = '<p class="hint" style="color:var(--danger);">โหลดรูปไม่ได้: '+escapeHtml(e.message)+'</p>'; });
-  $('#slipRejectBtn', back).addEventListener('click', ()=>{
-    openModal({title:'ปฏิเสธสลิป — ห้อง '+sl.roomCode, submitLabel:'ปฏิเสธสลิป', onSubmit: async fd=>{
-      const r = await lineCall('slip_reject', {slipId: sl.id, reason: fd.get('reason')||'', notify: fd.get('notify')==='on'});
-      await logAudit({action:'REJECT_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, reason: fd.get('reason')||''}});
-      toast('ปฏิเสธสลิปแล้ว'+(r.notified?' · แจ้งในกลุ่มห้องแล้ว':''),'ok'); back.remove(); renderSlipPanel();
-    }, bodyHtml:'<div class="field"><label>เหตุผล (เช่น ยอดไม่ตรง / ไม่ใช่สลิป / ยังไม่เห็นยอดเข้าบัญชี)</label><textarea name="reason" required></textarea></div>'+
-      '<label style="display:flex;gap:8px;align-items:center;font-weight:400;"><input type="checkbox" name="notify" style="width:auto;" checked> แจ้งในกลุ่มห้องให้ส่งสลิปใหม่</label>'});
-  });
+  $('#slipRejectBtn', back).addEventListener('click', ()=>openSlipRejectModal(sl, back));
+}
+function openSlipRejectModal(sl, parentBack){
+  openModal({title:'ยกเลิกสลิป — ห้อง '+sl.roomCode, submitLabel:'ยืนยันยกเลิกสลิป', onSubmit: async fd=>{
+    const r = await lineCall('slip_reject', {slipId: sl.id, reason: fd.get('reason')||'', notify: fd.get('notify')==='on'});
+    await logAudit({action:'REJECT_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, reason: fd.get('reason')||''}});
+    toast('ยกเลิกสลิปแล้ว'+(r.notified?' · แจ้งในกลุ่มห้องแล้ว':''),'ok'); if(parentBack) parentBack.remove(); renderSlipPanel();
+  }, bodyHtml:'<div class="field"><label>เหตุผล (เช่น ยอดไม่ตรง / ไม่ใช่สลิป / ยังไม่เห็นยอดเข้าบัญชี)</label><textarea name="reason" required></textarea></div>'+
+    '<label style="display:flex;gap:8px;align-items:center;font-weight:400;"><input type="checkbox" name="notify" style="width:auto;" checked> แจ้งในกลุ่มห้องให้ส่งสลิปใหม่</label>'});
 }
 
 function renderPayments(root){
@@ -3160,6 +3179,7 @@ function renderApprovals(root){
   const resolved = cache.approvals.filter(a=>a.status!=='PENDING').sort((a,b)=> (b.approvedAt||'')<(a.approvedAt||'')?-1:1).slice(0,20);
   root.innerHTML =
     '<div class="section-title"><div><h2>คำขออนุมัติ</h2><div class="desc">Void / คืนเงิน / ยกเลิกใบแจ้งหนี้ / ยกหนี้ / ส่วนลด — ผู้ร้องขอห้ามอนุมัติรายการของตนเอง</div></div></div>'+
+    '<div id="slipPanelAppr"></div>'+
     '<div class="card"><div class="card-head"><h3>รอดำเนินการ ('+pending.length+')</h3></div><div class="card-body flush" id="pendingWrap"></div></div>'+
     '<div class="card"><div class="card-head"><h3>ประวัติล่าสุด</h3></div><div class="card-body flush" id="resolvedWrap"></div></div>';
 
@@ -3175,7 +3195,7 @@ function renderApprovals(root){
       '<div class="alert-detail">เหตุผล: '+escapeHtml(a.reason)+'</div>'+
       '<div class="alert-meta">ร้องขอโดย '+escapeHtml(a.requestedByName)+' ('+(reqStaff?ROLE_LABEL[reqStaff.role]:'-')+') · ต้องการอนุมัติระดับ '+ROLE_LABEL[a.requiredRole||'OWNER']+' · '+fmtDateTime(a.requestedAt)+'</div></div>'+
       '<div class="tag-row">'+
-      (eligible ? '<button class="btn sm primary" data-approve="'+a.id+'">อนุมัติ</button><button class="btn sm danger" data-reject="'+a.id+'">ปฏิเสธ</button>' :
+      (eligible ? '<button class="btn sm primary" data-approve="'+a.id+'">อนุมัติ</button><button class="btn sm danger" data-reject="'+a.id+'">ยกเลิก</button>' :
         '<span class="pill muted">'+(isSelf?'รอผู้อื่นอนุมัติ':'ต้องสิทธิ์ '+ROLE_LABEL[a.requiredRole||'OWNER'])+'</span>')+
       '</div></div>';
   }).join('');
@@ -3184,16 +3204,17 @@ function renderApprovals(root){
   }));
   $all('[data-reject]', pw).forEach(b=>b.addEventListener('click', ()=>{
     const a = cache.approvals.find(x=>x.id===b.dataset.reject);
-    confirmModal({title:'ปฏิเสธคำขอ', submitLabel:'ยืนยันปฏิเสธ', bodyHtml:'<p>ปฏิเสธคำขอ “'+APPROVAL_TYPE_LABEL[a.type]+'” ของ '+escapeHtml(a.requestedByName)+' ใช่หรือไม่?</p>',
+    confirmModal({title:'ยกเลิกคำขอ', submitLabel:'ยืนยันยกเลิก', bodyHtml:'<p>ยกเลิกคำขอ “'+APPROVAL_TYPE_LABEL[a.type]+'” ของ '+escapeHtml(a.requestedByName)+' ใช่หรือไม่?</p>',
       onSubmit: async ()=>{ await resolveApproval(a,'REJECTED'); }});
   }));
 
+  renderSlipPanel();
   const rw = $('#resolvedWrap');
   if(!resolved.length){ rw.innerHTML = '<div class="empty-row">ยังไม่มีประวัติ</div>'; }
   else rw.innerHTML = resolved.map(a=>
     '<div class="alert-row"><div style="flex:1;"><div class="alert-title">'+APPROVAL_TYPE_LABEL[a.type]+(a.roomCode&&a.roomCode!=='-'?' — ห้อง '+a.roomCode:'')+'</div>'+
-    '<div class="alert-detail">ร้องขอโดย '+escapeHtml(a.requestedByName)+' · '+(a.approvedByName? (a.status==='APPROVED'?'อนุมัติ':'ปฏิเสธ')+'โดย '+escapeHtml(a.approvedByName):'')+' · '+fmtDateTime(a.approvedAt)+'</div></div>'+
-    '<span class="pill '+(a.status==='APPROVED'?'ok':'bad')+'">'+(a.status==='APPROVED'?'อนุมัติแล้ว':'ปฏิเสธ')+'</span></div>'
+    '<div class="alert-detail">ร้องขอโดย '+escapeHtml(a.requestedByName)+' · '+(a.approvedByName? (a.status==='APPROVED'?'อนุมัติ':'ยกเลิก')+'โดย '+escapeHtml(a.approvedByName):'')+' · '+fmtDateTime(a.approvedAt)+'</div></div>'+
+    '<span class="pill '+(a.status==='APPROVED'?'ok':'bad')+'">'+(a.status==='APPROVED'?'อนุมัติแล้ว':'ยกเลิก')+'</span></div>'
   ).join('');
 }
 
