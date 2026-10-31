@@ -978,20 +978,23 @@ async function requestRefund(payment, reason){
 
 /* ---- approvals: maker / checker ---- */
 async function resolveApproval(appr, decision /* 'APPROVED'|'REJECTED' */){
-  if(appr.requestedBy === Session.user.id){
+  const isSelf = appr.requestedBy === Session.user.id;
+  // Maker/Checker: nobody approves their own request — except the business OWNER (top authority, recorded in the audit log).
+  // Anyone may cancel (withdraw) a request they made themselves.
+  if(isSelf && decision==='APPROVED' && Session.user.role!=='OWNER'){
     throw new Error('ผู้ร้องขอห้ามอนุมัติรายการของตนเอง (Maker/Checker) — ต้องให้ผู้อื่นอนุมัติ');
   }
   const need = appr.requiredRole || 'OWNER';
   const rank = {STAFF:0,ADMIN:1,OWNER:2};
-  if(rank[Session.user.role] < rank[need]){
+  if(!(isSelf && decision!=='APPROVED') && rank[Session.user.role] < rank[need]){
     throw new Error('ต้องมีสิทธิ์ระดับ '+ROLE_LABEL[need]+' ขึ้นไปจึงจะอนุมัติรายการนี้ได้');
   }
-  await Store.update('approvals', appr.id, {status:decision, approvedBy:Session.user.id, approvedByName:Session.user.name, approvedAt: nowIso()});
+  await Store.update('approvals', appr.id, {status:decision, approvedBy:Session.user.id, approvedByName:Session.user.name, approvedAt: nowIso(), selfResolved: isSelf});
   if(decision==='APPROVED'){
     await applyApprovalEffect(appr);
   }
-  await logAudit({action:'RESOLVE_APPROVAL_'+decision, entityType:'approval', entityId:appr.id, newValue:{type:appr.type, entityId:appr.entityId}});
-  toast((decision==='APPROVED'?'อนุมัติ':'ปฏิเสธ')+'คำขอ: '+APPROVAL_TYPE_LABEL[appr.type], decision==='APPROVED'?'ok':undefined);
+  await logAudit({action:'RESOLVE_APPROVAL_'+decision, entityType:'approval', entityId:appr.id, newValue:{type:appr.type, entityId:appr.entityId, selfResolved:isSelf}});
+  toast((decision==='APPROVED'?'อนุมัติ':'ยกเลิก')+'คำขอ: '+APPROVAL_TYPE_LABEL[appr.type], decision==='APPROVED'?'ok':undefined);
 }
 async function applyApprovalEffect(appr){
   if(appr.type==='VOID_PAYMENT'){
@@ -3188,23 +3191,29 @@ function renderApprovals(root){
   else pw.innerHTML = pending.map(a=>{
     const isSelf = a.requestedBy===Session.user.id;
     const rank = {STAFF:0,ADMIN:1,OWNER:2};
-    const eligible = !isSelf && rank[Session.user.role] >= rank[a.requiredRole||'OWNER'];
+    const roleOk = rank[Session.user.role] >= rank[a.requiredRole||'OWNER'];
+    const canApprove = roleOk && (!isSelf || Session.user.role==='OWNER');
+    const canCancel = isSelf || roleOk;
     const reqStaff = cache.staff.find(s=>s.id===a.requestedBy);
     return '<div class="alert-row warn"><div class="alert-stripe"></div><div style="flex:1;min-width:0;">'+
       '<div class="alert-title">'+APPROVAL_TYPE_LABEL[a.type]+(a.roomCode&&a.roomCode!=='-'?' — ห้อง '+a.roomCode:'')+(a.amount?' · '+money(a.amount)+' บาท':'')+'</div>'+
       '<div class="alert-detail">เหตุผล: '+escapeHtml(a.reason)+'</div>'+
       '<div class="alert-meta">ร้องขอโดย '+escapeHtml(a.requestedByName)+' ('+(reqStaff?ROLE_LABEL[reqStaff.role]:'-')+') · ต้องการอนุมัติระดับ '+ROLE_LABEL[a.requiredRole||'OWNER']+' · '+fmtDateTime(a.requestedAt)+'</div></div>'+
       '<div class="tag-row">'+
-      (eligible ? '<button class="btn sm primary" data-approve="'+a.id+'">อนุมัติ</button><button class="btn sm danger" data-reject="'+a.id+'">ยกเลิก</button>' :
-        '<span class="pill muted">'+(isSelf?'รอผู้อื่นอนุมัติ':'ต้องสิทธิ์ '+ROLE_LABEL[a.requiredRole||'OWNER'])+'</span>')+
+      (canApprove ? '<button class="btn sm primary" data-approve="'+a.id+'">อนุมัติคำขอ</button>' : '<span class="pill muted">'+(isSelf?'รอผู้อื่นอนุมัติ':'ต้องสิทธิ์ '+ROLE_LABEL[a.requiredRole||'OWNER'])+'</span>')+
+      (canCancel ? '<button class="btn sm danger" data-reject="'+a.id+'">ยกเลิกคำขอ</button>' : '')+
       '</div></div>';
   }).join('');
   $all('[data-approve]', pw).forEach(b=>b.addEventListener('click', async ()=>{
-    try{ await resolveApproval(cache.approvals.find(a=>a.id===b.dataset.approve), 'APPROVED'); }catch(e){ toast(e.message,'err'); }
+    const a = cache.approvals.find(x=>x.id===b.dataset.approve);
+    const self = a.requestedBy===Session.user.id;
+    confirmModal({title:'อนุมัติคำขอ', submitLabel:'ยืนยันอนุมัติ', bodyHtml:'<p>อนุมัติคำขอ “'+APPROVAL_TYPE_LABEL[a.type]+'”'+(a.roomCode&&a.roomCode!=='-'?' ห้อง '+escapeHtml(a.roomCode):'')+(a.amount?' ('+money(a.amount)+' บาท)':'')+' ใช่หรือไม่?</p>'+
+      (self?'<div class="help-box">คำขอนี้คุณเป็นผู้ร้องขอเอง — ในฐานะเจ้าของกิจการอนุมัติได้ และระบบจะบันทึกไว้ในบันทึกตรวจสอบว่าอนุมัติเอง</div>':''),
+      onSubmit: async ()=>{ await resolveApproval(a,'APPROVED'); }});
   }));
   $all('[data-reject]', pw).forEach(b=>b.addEventListener('click', ()=>{
     const a = cache.approvals.find(x=>x.id===b.dataset.reject);
-    confirmModal({title:'ยกเลิกคำขอ', submitLabel:'ยืนยันยกเลิก', bodyHtml:'<p>ยกเลิกคำขอ “'+APPROVAL_TYPE_LABEL[a.type]+'” ของ '+escapeHtml(a.requestedByName)+' ใช่หรือไม่?</p>',
+    confirmModal({title:'ยกเลิกคำขอ', submitLabel:'ยืนยันยกเลิกคำขอ', bodyHtml:'<p>ยกเลิกคำขอ “'+APPROVAL_TYPE_LABEL[a.type]+'”'+(a.roomCode&&a.roomCode!=='-'?' ห้อง '+escapeHtml(a.roomCode):'')+' ของ '+escapeHtml(a.requestedByName)+' ใช่หรือไม่? (รายการจะไม่ถูกดำเนินการ)</p>',
       onSubmit: async ()=>{ await resolveApproval(a,'REJECTED'); }});
   }));
 
