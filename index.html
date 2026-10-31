@@ -288,9 +288,14 @@ function fmtDateTime(iso){ if(!iso) return '-'; try{ return new Intl.DateTimeFor
 function fmtDate(iso){ if(!iso) return '-'; try{ return new Intl.DateTimeFormat('th-TH',{dateStyle:'medium'}).format(new Date(iso)); }catch(e){ return iso; } }
 function nowIso(){ return new Date().toISOString(); }
 function currentPeriod(){ const d=new Date(); return d.getFullYear()+String(d.getMonth()+1).padStart(2,'0'); }
+function prevPeriod(p){ let y=+p.slice(0,4), m=+p.slice(4,6)-1; if(m<1){ m=12; y--; } return y+String(m).padStart(2,'0'); }
+function nextPeriod(p){ let y=+p.slice(0,4), m=+p.slice(4,6)+1; if(m>12){ m=1; y++; } return y+String(m).padStart(2,'0'); }
+/* Rent is billed in advance: a bill made on the last day of a month (31 Oct) or on the 1st (1 Nov) is for the NEXT/this month's rent (Nov).
+   Its water/electricity come from the meters read at the end of the previous month (Oct). */
+function billPeriodNow(){ const d=new Date(); const last=new Date(d.getFullYear(), d.getMonth()+1, 0).getDate(); return d.getDate()>=last ? nextPeriod(currentPeriod()) : currentPeriod(); }
 function periodLabel(p){ if(!p||p.length!==6) return p||'-'; const y=p.slice(0,4), m=parseInt(p.slice(4,6),10);
   const names=['','มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
-  return (names[m]||m)+' '+y; }
+  return (names[m]||m)+' '+(parseInt(y,10)+543); }
 function toast(msg,kind){ const el=document.createElement('div'); el.className='toast'+(kind?' '+kind:''); el.textContent=msg;
   document.getElementById('toasts').appendChild(el); setTimeout(()=>{ el.style.transition='opacity .25s'; el.style.opacity='0'; setTimeout(()=>el.remove(),250); },3200); }
 function initials(name){ if(!name) return '?'; const parts=String(name).trim().split(/\s+/); return (parts[0][0]||'')+((parts[1]&&parts[1][0])||''); }
@@ -490,9 +495,9 @@ async function lineCall(action, payload){
    ============================================================ */
 const cache = {
   staff:[], properties:[], rooms:[], tenants:[], leases:[], meterReadings:[], invoices:[],
-  payments:[], approvals:[], auditLog:[], reservations:[], repairRequests:[], expenses:[], config:{}, ready:{}
+  payments:[], approvals:[], auditLog:[], reservations:[], repairRequests:[], expenses:[], moveOuts:[], config:{}, ready:{}
 };
-const COLLECTIONS = ['staff','properties','rooms','tenants','leases','meterReadings','invoices','payments','approvals','auditLog','reservations','repairRequests','expenses'];
+const COLLECTIONS = ['staff','properties','rooms','tenants','leases','meterReadings','invoices','payments','approvals','auditLog','reservations','repairRequests','expenses','moveOuts'];
 
 function subscribeAll(){
   COLLECTIONS.forEach(name=>{
@@ -761,7 +766,7 @@ async function createTenantAndLease(data){
   const tenantId = await Store.add('tenants', {name:data.name, phone:data.phone, address:data.address||'',
     idCardPhotoUrl:data.idCardPhotoUrl||'', active:true, createdAt: nowIso()});
   const leaseId = await Store.add('leases', {
-    roomId:data.roomId, roomCode:data.roomCode, tenantId, tenantName:data.name, rent:data.rent,
+    roomId:data.roomId, roomCode:data.roomCode, tenantId, tenantName:data.name, rent:data.rent, deposit: data.deposit!=null? Number(data.deposit): Number(data.rent||0),
     startDate:data.startDate, endDate:null, active:true, contractPhotoUrl:data.contractPhotoUrl||'', createdAt: nowIso()
   });
   await Store.update('rooms', data.roomId, {status:'OCCUPIED'});
@@ -779,11 +784,11 @@ async function endLease(lease){
 /* ---- meter readings ---- */
 function latestReadingFor(roomId, type, beforePeriod){
   const rows = cache.meterReadings.filter(r=>r.roomId===roomId && r.type===type && (!beforePeriod || r.period<beforePeriod));
-  rows.sort((a,b)=> a.period<b.period?1:-1);
+  rows.sort((a,b)=> a.period<b.period?1:(a.period>b.period?-1:((b.timestamp||'')<(a.timestamp||'')?-1:1)));
   return rows[0]||null;
 }
 function readingFor(roomId, type, period){
-  return cache.meterReadings.find(r=>r.roomId===roomId && r.type===type && r.period===period) || null;
+  return cache.meterReadings.find(r=>r.roomId===roomId && r.type===type && r.period===period && !r.moveOut) || null;
 }
 async function recordMeterReading({roomId, roomCode, type, value, period, photoDataUrl}){
   const existing = readingFor(roomId, type, period);
@@ -847,11 +852,12 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   const prop = propertyById(room.propertyId);
   const lease = activeLeaseFor(roomId);
   const rent = lease? lease.rent : room.rent;
-  const water = readingFor(roomId,'water',period);
-  const elec = readingFor(roomId,'elec',period);
+  const readPeriod = prevPeriod(period);   // meters read at the end of the previous month are billed with this month's rent
+  const water = readingFor(roomId,'water',readPeriod);
+  const elec = readingFor(roomId,'elec',readPeriod);
   const cfg = cache.config;
-  if(roomWaterMode(room)==='SEPARATE' && !water) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์น้ำงวด '+periodLabel(period)+' — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
-  if(roomElecMode(room)==='SEPARATE' && !elec) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์ไฟงวด '+periodLabel(period)+' — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
+  if(roomWaterMode(room)==='SEPARATE' && !water) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์น้ำเดือน '+periodLabel(readPeriod)+' (สำหรับค่าเช่าเดือน '+periodLabel(period)+') — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
+  if(roomElecMode(room)==='SEPARATE' && !elec) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์ไฟเดือน '+periodLabel(readPeriod)+' (สำหรับค่าเช่าเดือน '+periodLabel(period)+') — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
   const waterMode = roomWaterMode(room);
   const elecMode = roomElecMode(room);
   let waterAmount = 0;
@@ -872,7 +878,7 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   const invSeq = await nextInvoiceSeq(room.propertyId, prop.code, period);
   const invId = await Store.add('invoices', {
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: room.propertyId, propertyCode: prop.code,
-    roomId, roomCode, period, waterMode, elecMode, rentAmount:rent,
+    roomId, roomCode, period, readingPeriod: readPeriod, waterMode, elecMode, rentAmount:rent,
     waterUnits: water?water.usage:0, waterAmount, elecUnits: elec?elec.usage:0, elecAmount, commonFee,
     discount, discountReason: discountReason||'', discountState, discountApprovedBy: discountState==='approved'? Session.user.name : '',
     total, status: discountState==='pending' ? 'pending_discount' : 'unpaid',
@@ -1266,9 +1272,9 @@ function monthsBetweenPeriods(p1,p2){
   return (y2-y1)*12 + (m2-m1);
 }
 function computeOverdueInvoices(){
-  const period = currentPeriod();
+  const period = billPeriodNow();
   const scopedRoomIds = new Set(scopedRooms().map(r=>r.id));
-  return cache.invoices.filter(i=> ['unpaid','partial','pending_discount'].includes(i.status) && i.period<period && scopedRoomIds.has(i.roomId))
+  return cache.invoices.filter(i=> ['unpaid','partial','pending_discount'].includes(i.status) && !i.moveOutId && i.period<period && scopedRoomIds.has(i.roomId))
     .map(i=>{
       const paid = cache.payments.filter(p=>p.invoiceId===i.id && p.status==='active').reduce((s,p)=>s+p.amount,0);
       const outstanding = Math.max(0, i.total-paid);
@@ -1279,7 +1285,7 @@ function computeOverdueInvoices(){
     .sort((a,b)=> b.monthsOverdue-a.monthsOverdue || b.outstanding-a.outstanding);
 }
 function computePropertyOverview(){
-  const period = currentPeriod();
+  const period = billPeriodNow();
   const props = selectedPropertyId==='ALL' ? activeProperties() : activeProperties().filter(p=>p.id===selectedPropertyId);
   return props.map(p=>{
     const rooms = activeRooms().filter(r=>r.propertyId===p.id);
@@ -1302,7 +1308,7 @@ function computeDailyControl(dateStr){
   const cash = pays.filter(p=>p.method==='cash').reduce((s,p)=>s+p.amount,0);
   const transfer = pays.filter(p=>p.method==='transfer').reduce((s,p)=>s+p.amount,0);
   const qr = pays.filter(p=>p.method==='qr').reduce((s,p)=>s+p.amount,0);
-  const period = currentPeriod();
+  const period = billPeriodNow();
   const invIssued = cache.invoices.filter(i=>i.period===period).length;
   const invPaid = cache.invoices.filter(i=>i.period===period && i.status==='paid').length;
   const outstanding = cache.invoices.filter(i=>i.period===period && ['unpaid','partial','pending_discount'].includes(i.status))
@@ -1313,7 +1319,7 @@ function computeDailyControl(dateStr){
   return {cash,transfer,qr,total:cash+transfer+qr, invIssued, invPaid, outstanding, voidsToday, discountsToday, refundsToday};
 }
 function computeRoomPaymentStatus(){
-  const period = currentPeriod();
+  const period = billPeriodNow();
   const day = new Date().getDate();
   return scopedRooms().filter(r=>r.status==='OCCUPIED').slice().sort((a,b)=>{
     if(a.propertyId!==b.propertyId){ const pa=propertyById(a.propertyId), pb=propertyById(b.propertyId);
@@ -1438,6 +1444,7 @@ const NAV = [
   {id:'payments', label:'การรับชำระเงิน', ic:'payment'},
   {id:'repairs', label:'แจ้งซ่อม', ic:'wrench'},
   {id:'expenses', label:'รายรับ-รายจ่ายอื่นๆ', ic:'cash'},
+  {id:'moveouts', label:'สิ้นสุดสัญญา/คืนมัดจำ', ic:'payment'},
   {id:'approvals', label:'คำขออนุมัติ', ic:'approvals'},
   {id:'audit', label:'บันทึกตรวจสอบ', ic:'audit'},
   {id:'settings', label:'ตั้งค่า', ic:'settings'},
@@ -1543,7 +1550,7 @@ function renderShell(){
 
   const content = $('#content');
   const renderers = { dashboard: renderDashboard, properties: renderProperties, rooms: renderRooms, bookings: renderBookings, meters: renderMeters, invoices: renderInvoices,
-    payments: renderPayments, repairs: renderRepairs, expenses: renderExpenses, approvals: renderApprovals,
+    payments: renderPayments, repairs: renderRepairs, expenses: renderExpenses, moveouts: renderMoveOuts, approvals: renderApprovals,
     audit: renderAudit, settings: renderSettings };
   (renderers[r] || renderDashboard)(content);
   if(can('REVIEW_SLIP') && !SlipUi.countLoaded){
@@ -1767,11 +1774,7 @@ function renderRooms(root){
         ((lease&&lease.contractPhotoUrl)? '<img class="photo-thumb" data-zoom="'+lease.contractPhotoUrl+'" src="'+lease.contractPhotoUrl+'">' : '<span class="pill bad">ไม่มีรูป (ผูกผู้เช่าก่อนใช้ระบบเวอร์ชันนี้)</span>')+'</div>'});
     $all('[data-zoom]', docsModalEl).forEach(img=>img.addEventListener('click', ()=>lightbox(img.dataset.zoom)));
   }));
-  $all('[data-endlease]', body).forEach(b=>b.addEventListener('click', ()=>{
-    const lease = cache.leases.find(l=>l.id===b.dataset.endlease);
-    confirmModal({title:'สิ้นสุดสัญญาห้อง '+lease.roomCode, bodyHtml:'<p>ยืนยันสิ้นสุดสัญญาของ <strong>'+escapeHtml(lease.tenantName)+'</strong>? ห้องจะถูกตั้งเป็นห้องว่างโดยอัตโนมัติ</p>',
-      onSubmit: async ()=>{ await endLease(lease); }});
-  }));
+  $all('[data-endlease]', body).forEach(b=>b.addEventListener('click', ()=>{ openMoveOutModal(cache.leases.find(l=>l.id===b.dataset.endlease)); }));
   $all('[data-status]', body).forEach(sel=>sel.addEventListener('change', async ()=>{
     const r = roomById(sel.dataset.status);
     if(activeLeaseFor(r.id) && sel.value!=='OCCUPIED'){ toast('ห้องนี้มีสัญญาที่ใช้งานอยู่ — สิ้นสุดสัญญาก่อนเปลี่ยนสถานะ','err'); sel.value=r.status; return; }
@@ -1867,7 +1870,7 @@ function openEditStaffModal(s){
 /* Shared tenant-binding form used both from the room "+ ผูกผู้เช่า" action and from
    confirming a room booking. Requires name/address/phone plus ID-card and contract photo
    evidence — anti-fraud requirement. `onSubmit(data)` receives the assembled tenant data. */
-function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhone, onSubmit}){
+function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhone, prefillDeposit, onSubmit}){
   openModal({title, submitLabel: submitLabel||'บันทึก', onSubmit: async fd=>{
     const name = (fd.get('name')||'').trim();
     const address = (fd.get('address')||'').trim();
@@ -1881,13 +1884,14 @@ function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhon
     if(!contractFile || !contractFile.size) throw new Error('กรุณาแนบรูปถ่ายสัญญาเช่า');
     const idCardPhotoUrl = await fileToCompressedDataUrl(idFile);
     const contractPhotoUrl = await fileToCompressedDataUrl(contractFile);
-    await onSubmit({name, address, phone, rent:Number(fd.get('rent')), startDate:fd.get('startDate'), idCardPhotoUrl, contractPhotoUrl});
+    await onSubmit({name, address, phone, rent:Number(fd.get('rent')), deposit:Number(fd.get('deposit')||0), startDate:fd.get('startDate'), idCardPhotoUrl, contractPhotoUrl});
   }, bodyHtml:
     '<div class="field"><label>ชื่อ-สกุลผู้เช่า (*บังคับ)</label><input name="name" required value="'+escapeHtml(prefillName||'')+'"></div>'+
     '<div class="field"><label>ที่อยู่ (*บังคับ)</label><textarea name="address" required placeholder="ที่อยู่ตามบัตรประชาชนหรือที่อยู่ปัจจุบัน"></textarea></div>'+
     '<div class="field"><label>เบอร์โทร (*บังคับ)</label><input name="phone" required placeholder="08x-xxx-xxxx" value="'+escapeHtml(prefillPhone||'')+'"></div>'+
     '<div class="field-row"><div class="field"><label>ค่าเช่า (บาท) — ตามค่า default (แก้ไขได้)</label><input name="rent" type="number" required value="'+room.rent+'"></div>'+
     '<div class="field"><label>วันที่เข้าพัก</label><input name="startDate" type="date" required value="'+todayStr()+'"></div></div>'+
+    '<div class="field"><label>เงินมัดจำที่รับ (บาท) — ปกติ 1 เดือนของค่าเช่า</label><input name="deposit" type="number" min="0" step="0.01" value="'+(prefillDeposit!=null?prefillDeposit:room.rent)+'"><p class="hint">ใช้คำนวณเงินคืนตอนสิ้นสุดสัญญา</p></div>'+
     '<div class="field"><label>รูปถ่ายบัตรประชาชน (*บังคับ)</label><input name="idCardPhoto" type="file" accept="image/*" capture="environment" required>'+
     '<p class="hint">'+icon('camera')+' ถ่ายรูปบัตรประชาชนผู้เช่าหรือแนบไฟล์รูป ระบบจะบีบอัดไฟล์อัตโนมัติ</p></div>'+
     '<div class="field"><label>รูปถ่ายสัญญาเช่า (*บังคับ)</label><input name="contractPhoto" type="file" accept="image/*" capture="environment" required>'+
@@ -2370,7 +2374,7 @@ function renderInvoices(root){
     return (b.period||'')<(a.period||'')?-1:1;
   });
   const gaps = computeInvoiceGaps().filter(g=> selectedPropertyId==='ALL' || g.propertyId===selectedPropertyId);
-  const period = currentPeriod();
+  const period = billPeriodNow();
   const genEligible = scopedRooms().filter(r=>r.status==='OCCUPIED' && activeLeaseFor(r.id) &&
     !cache.invoices.some(i=>i.roomId===r.id && i.period===period && i.status!=='cancelled'));
   root.innerHTML =
@@ -2394,7 +2398,7 @@ function renderInvoices(root){
     const waterInclusive = (i.waterMode||i.billingMode)==='INCLUSIVE';
     const elecInclusive = (i.elecMode||i.billingMode)==='INCLUSIVE';
     const waterFlat = i.waterMode==='FLAT';
-    return '<tr><td class="mono">'+(i.invoiceNumber||'-')+(i.replacesInvoiceId?'<div class="footnote">แทนใบเดิม</div>':'')+
+    return '<tr><td class="mono">'+(i.invoiceNumber||'-')+(i.replacesInvoiceId?'<div class="footnote">แทนใบเดิม</div>':'')+(i.moveOutId?'<div class="footnote">หักจากเงินมัดจำ (ย้ายออก)</div>':'')+
       (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
       '<td class="num">'+money(i.rentAmount)+'</td>'+
       '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':'')))+'</td>'+
@@ -2433,6 +2437,7 @@ function renderInvoices(root){
   $all('[data-sendbill]', body).forEach(b=>b.addEventListener('click', ()=>{ const inv = cache.invoices.find(i=>i.id===b.dataset.sendbill); openSendBillsModal({period:inv.period, onlyId:inv.id}); }));
   if($('#bulkGenBtn')) $('#bulkGenBtn').addEventListener('click', ()=>{
     confirmModal({title:'ออกใบแจ้งหนี้ทุกห้อง งวด '+periodLabel(period), submitLabel:'ยืนยันออกใบแจ้งหนี้ทั้งหมด', bodyHtml:
+      '<div class="help-box">ค่าเช่าเดือน <b>'+periodLabel(period)+'</b> · ค่าน้ำ-ไฟคิดจากมิเตอร์เดือน <b>'+periodLabel(prevPeriod(period))+'</b> (ที่จดปลายเดือน)</div>'+
       '<p>ระบบจะสรุปและออกใบแจ้งหนี้ให้ทุกห้องที่มีผู้เช่าและยังไม่มีใบแจ้งหนี้งวดนี้ ('+genEligible.length+' ห้อง) โดยเรียงตามรหัสหอพักแล้วเลขห้อง คำนวณค่าเช่า/ค่าน้ำ-ไฟ/ค่าส่วนกลางจากข้อมูลห้องและมิเตอร์โดยอัตโนมัติ</p>',
       onSubmit: async ()=>{
         const ordered = genEligible.slice().sort((a,b)=>{
@@ -2465,7 +2470,7 @@ async function openSendBillsModal({period, onlyId}){
   if(period && !periods.includes(period)) periods.unshift(period);
   const props = activeProperties();
   const startProp = (selectedPropertyId!=='ALL' && props.some(p=>p.id===selectedPropertyId)) ? selectedPropertyId : 'ALL';
-  const state = {period: period||periods[0]||currentPeriod(), prop: startProp, resend:false};
+  const state = {period: period||periods[0]||billPeriodNow(), prop: startProp, resend:false};
   const back = openModal({title: onlyId ? 'ส่งบิลเข้ากลุ่มห้อง' : 'ตรวจสอบและส่งบิลเข้ากลุ่มห้อง', wide:true, submitLabel:'ส่งบิลที่เลือก', onSubmit: async ()=>{
     const ids = $all('input[data-sb]:checked', back).map(c=>c.dataset.sb);
     if(!ids.length) throw new Error('ยังไม่ได้เลือกใบแจ้งหนี้');
@@ -2581,8 +2586,8 @@ async function openLineNotifyModal({invoices, period}){
   const single = !!(invoices && invoices.length===1);
   const ready = await lineStatus();
   const scopeIds = new Set(scopedRooms().map(r=>r.id));
-  const periods = pastPeriods(currentPeriod(),3).slice().reverse();
-  const startPeriod = period || (single? invoices[0].period : currentPeriod());
+  const periods = pastPeriods(billPeriodNow(),3).slice().reverse();
+  const startPeriod = period || (single? invoices[0].period : billPeriodNow());
   const getInvs = p => single ? invoices : cache.invoices.filter(i=>i.period===p && i.status!=='cancelled' && scopeIds.has(i.roomId));
   const initial = getInvs(startPeriod);
   if(!initial.length){ toast('ยังไม่มีใบแจ้งหนี้ในงวดนี้ให้แจ้ง','err'); return; }
@@ -2792,14 +2797,14 @@ async function initAutoSettings(card){
 function openInvoiceModal(){
   const eligible = scopedRooms().filter(r=>activeLeaseFor(r.id));
   if(!eligible.length){ toast('ยังไม่มีห้องที่มีสัญญาผู้เช่าที่ใช้งานอยู่ในขอบเขตที่เลือก','err'); return; }
-  const periods = pastPeriods(currentPeriod(),3);
+  const periods = pastPeriods(billPeriodNow(),3);
   openModal({title:'ออกใบแจ้งหนี้', onSubmit: async fd=>{
     const roomId = fd.get('roomId'); const room = roomById(roomId);
     await generateInvoice({roomId, roomCode:room.code, period:fd.get('period'), discount:fd.get('discount'), discountReason:fd.get('discountReason')});
   }, bodyHtml:
     '<div class="field"><label>ห้อง</label><select name="roomId" required>'+eligible.map(r=>'<option value="'+r.id+'">'+r.code+' — '+activeLeaseFor(r.id).tenantName+' (น้ำ:'+WATER_MODE_LABEL[roomWaterMode(r)]+' / ไฟ:'+ELEC_MODE_LABEL[roomElecMode(r)]+')</option>').join('')+'</select></div>'+
-    '<div class="field"><label>งวดบิล</label><select name="period" required>'+periods.slice().reverse().map(p=>'<option value="'+p+'" '+(p===currentPeriod()?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select>'+
-    '<p class="hint">ระบบจะดึงค่าเช่าและค่าส่วนกลางจากห้อง และคำนวณค่าน้ำ-ไฟจากมิเตอร์โดยอัตโนมัติ (ห้ามคิดค่าน้ำ-ไฟแยกถ้าห้องตั้งเป็น “รวมในค่าเช่า”)</p></div>'+
+    '<div class="field"><label>งวดบิล</label><select name="period" required>'+periods.slice().reverse().map(p=>'<option value="'+p+'" '+(p===billPeriodNow()?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select>'+
+    '<p class="hint">ใบแจ้งหนี้เป็นค่าเช่าของเดือนที่เลือก ส่วนค่าน้ำ-ไฟคิดจากมิเตอร์ที่จดปลายเดือนก่อนหน้า (เช่น ค่าเช่า พ.ย. ใช้มิเตอร์ที่จด ต.ค.) · ระบบจะดึงค่าเช่าและค่าส่วนกลางจากห้อง และคำนวณค่าน้ำ-ไฟจากมิเตอร์โดยอัตโนมัติ (ห้ามคิดค่าน้ำ-ไฟแยกถ้าห้องตั้งเป็น “รวมในค่าเช่า”)</p></div>'+
     '<div class="field-row"><div class="field"><label>ส่วนลด (บาท, ถ้ามี)</label><input name="discount" type="number" min="0" value="0"></div>'+
     '<div class="field"><label>เหตุผลส่วนลด</label><input name="discountReason" placeholder="ไม่บังคับถ้าไม่มีส่วนลด"></div></div>'+
     '<div class="help-box">ส่วนลดเกิน '+(cache.config.discountApprovalThreshold||100)+' บาท ต้องผ่านการอนุมัติจากเจ้าของกิจการ ส่วนลดของพนักงานทุกจำนวนต้องผ่านผู้ดูแลระบบขึ้นไปก่อนเสมอ</div>'});
@@ -2942,7 +2947,7 @@ function renderPayments(root){
   root.innerHTML =
     '<div class="section-title"><div><h2>การรับชำระเงิน &amp; ใบเสร็จ</h2><div class="desc">ออกใบเสร็จได้ต่อเมื่อแนบหลักฐานการชำระเงินแล้วเท่านั้น เลขที่รันต่อเนื่องโดยระบบ ห้ามลบ — ผิดพลาดต้อง VOID แล้วรับชำระใหม่แทน</div></div></div>'+
     '<div id="slipPanel"></div>'+
-    '<div class="card"><div class="card-head"><div><h3>สถานะการชำระเงินรายห้อง — งวด '+periodLabel(currentPeriod())+'</h3>'+
+    '<div class="card"><div class="card-head"><div><h3>สถานะการชำระเงินรายห้อง — งวด '+periodLabel(billPeriodNow())+'</h3>'+
       '<div class="desc">เรียงตามรหัสหอพัก แล้วเลขห้อง — เขียว: ชำระแล้ว · เหลือง: ยังไม่ถึงกำหนด (ไม่เกินวันที่ 5) · แดง: ค้างชำระเกินวันที่ 5</div></div>'+
       '<div class="tag-row"><span class="pill ok">ชำระแล้ว '+counts.PAID+'</span><span class="pill warn">รอครบกำหนด '+counts.DUE+'</span><span class="pill bad">ค้างเกินกำหนด '+counts.OVERDUE+'</span></div>'+
     '</div><div class="room-status-grid" id="roomStatusGrid"></div></div>'+
@@ -3172,6 +3177,266 @@ function openEditExpenseModal(e){
     '<div class="field"><label>ยอดเงิน (บาท)</label><input name="amount" type="number" min="0.01" step="0.01" required value="'+e.amount+'"></div>'+
     '<div class="field"><label>หมายเหตุ</label><input name="note" value="'+escapeHtml(e.note||'')+'"></div>'});
   wireExpenseTypeToggle(modalEl);
+}
+
+/* ============================================================
+   MOVE-OUT: end of lease, meter reading on the move-out day, deposit settlement + refund via LINE
+   moveOuts doc: {leaseId,roomId,roomCode,propertyId,tenantName,moveOutDate,deposit,inputs,water,elec,lines[],deductionTotal,refund,status,...}
+   status: DRAFT -> NOTIFIED (sent to room group, waiting for bank account) -> ACCOUNT_RECEIVED -> REFUNDED
+           (refund <= 0: NOTIFIED -> SETTLED once any shortfall is paid / nothing to pay)
+   ============================================================ */
+const MOVEOUT_STATUS = { DRAFT:'ยังไม่แจ้งลูกค้า', NOTIFIED:'แจ้งลูกค้าแล้ว', ACCOUNT_RECEIVED:'ได้รับเลขบัญชี รอโอนคืน', REFUNDED:'โอนคืนแล้ว', SETTLED:'ปิดรายการแล้ว' };
+const MOVEOUT_PILL = { DRAFT:'warn', NOTIFIED:'info', ACCOUNT_RECEIVED:'warn', REFUNDED:'ok', SETTLED:'ok' };
+const THAI_BANKS = ['ธนาคารกสิกรไทย','ธนาคารไทยพาณิชย์','ธนาคารกรุงเทพ','ธนาคารกรุงไทย','ธนาคารกรุงศรีอยุธยา','ธนาคารทหารไทยธนชาต (ttb)','ธนาคารออมสิน','ธนาคาร ธ.ก.ส.','ธนาคารอื่นๆ (ระบุในหมายเหตุ)'];
+const r2 = n => Math.round(Number(n||0)*100)/100;
+function leaseDeposit(l){ return (l && l.deposit!=null && l.deposit!=='') ? Number(l.deposit) : Number((l&&l.rent)||0); }
+function ymdLocal(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function fmtThaiDate(ymd){ if(!ymd) return '-'; const [y,m,d]=ymd.split('-').map(Number); const mn=['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.']; return d+' '+mn[m-1]+' '+(y+543); }
+/* rent from `fromStr` to `toStr` (inclusive), month by month: a full month = full rent, a part month = days/days-in-month */
+function rentBetween(rent, fromStr, toStr){
+  let cur = new Date(fromStr+'T00:00:00'); const end = new Date(toStr+'T00:00:00'); let amt = 0, days = 0;
+  while(cur<=end){
+    const y=cur.getFullYear(), m=cur.getMonth(), dim=new Date(y,m+1,0).getDate(), monthEnd=new Date(y,m,dim);
+    const segEnd = monthEnd<end ? monthEnd : end; const n = Math.round((segEnd-cur)/86400000)+1;
+    amt += (n===dim ? rent : rent*n/dim); days += n; cur = new Date(y,m,dim+1);
+  }
+  return { amount:r2(amt), days };
+}
+/* meter value that has already been billed (or the opening baseline) for a room/type */
+function billedMeterBase(roomId, type){
+  const rows = cache.meterReadings.filter(r=>r.roomId===roomId && r.type===type && !r.moveOut).sort((a,b)=>a.period<b.period?-1:1);
+  const billed = rows.filter(r=>r.invoiceId || r.baseline);
+  if(billed.length) return { value: Number(billed[billed.length-1].value), period: billed[billed.length-1].period };
+  if(rows.length) return { value: Number(rows[0].previousValue||0), period: '' };
+  return null;
+}
+function moveOutOutstanding(roomId){
+  return cache.invoices.filter(i=>i.roomId===roomId && !i.moveOutId && ['unpaid','partial','pending_discount'].includes(i.status)).map(i=>{
+    const paid = cache.payments.filter(p=>p.invoiceId===i.id && p.status==='active').reduce((s,p)=>s+p.amount,0);
+    return { inv:i, rem: r2(Math.max(0, i.total-paid)) };
+  }).filter(x=>x.rem>0).sort((a,b)=>a.inv.period<b.inv.period?-1:1);
+}
+function moveOutDefaults(lease, moveOutDate){
+  const room = roomById(lease.roomId); const rent = Number(lease.rent||room.rent||0);
+  const invs = cache.invoices.filter(i=>i.roomId===lease.roomId && i.status!=='cancelled').sort((a,b)=>a.period<b.period?1:-1);
+  let coveredThrough;
+  if(invs.length){ const p = invs[0].period; coveredThrough = ymdLocal(new Date(+p.slice(0,4), +p.slice(4,6), 0)); }
+  else { const d = new Date(moveOutDate+'T00:00:00'); coveredThrough = ymdLocal(new Date(d.getFullYear(), d.getMonth(), 0)); }
+  let rentInfo = { amount:0, days:0, coveredThrough };
+  if(moveOutDate > coveredThrough){
+    const from = ymdLocal(new Date(new Date(coveredThrough+'T00:00:00').getTime()+86400000));
+    const rb = rentBetween(rent, from, moveOutDate); rentInfo = { ...rb, from, coveredThrough };
+  }
+  return { rent, rentInfo };
+}
+function calcMoveOutLines(f){
+  const lines = []; const out = { lines, water:null, elec:null };
+  const room = roomById(f.roomId); const cfg = cache.config||{};
+  [['water','ค่าน้ำประปา',cfg.waterRate, roomWaterMode(room)==='SEPARATE'], ['elec','ค่าไฟฟ้า',cfg.elecRate, roomElecMode(room)==='SEPARATE']].forEach(([t,label,rate,sep])=>{
+    if(!sep) return;
+    const base = billedMeterBase(f.roomId, t); const prev = base? base.value : 0;
+    const fin = f[t+'Final']; if(fin===''||fin==null||isNaN(Number(fin))) { out[t]={prev, final:null, units:0, amount:0}; return; }
+    const units = r2(Math.max(0, Number(fin)-prev)); const amount = Math.round(units*Number(rate||0));
+    out[t] = { prev, final:Number(fin), units, amount };
+    if(units>0 || amount>0) lines.push({key:t, label: label+' (มิเตอร์ '+prev+' → '+Number(fin)+' = '+units+' หน่วย × '+rate+')', amount});
+  });
+  if(f.unpaid>0) lines.push({key:'unpaid', label:'ยอดค้างชำระเดิม'+(f.unpaidNote?' ('+f.unpaidNote+')':''), amount:r2(f.unpaid)});
+  if(f.rent>0) lines.push({key:'rent', label:'ค่าเช่าถึงวันย้ายออก'+(f.rentNote?' ('+f.rentNote+')':''), amount:r2(f.rent)});
+  if(f.cleaning>0) lines.push({key:'cleaning', label:'ค่าทำความสะอาด/ค่าซ่อม'+(f.cleaningNote?' ('+f.cleaningNote+')':''), amount:r2(f.cleaning)});
+  if(f.other && Number(f.other)!==0) lines.push({key:'other', label:(Number(f.other)>0?'หักอื่นๆ':'คืนเพิ่ม/ปรับปรุง')+(f.otherNote?' ('+f.otherNote+')':''), amount:r2(f.other)});
+  out.deductionTotal = r2(lines.reduce((s,l)=>s+l.amount,0));
+  out.refund = r2(Number(f.deposit||0) - out.deductionTotal);
+  return out;
+}
+async function saveMoveOut(lease, f, existing){
+  const room = roomById(lease.roomId); const prop = propertyById(room.propertyId);
+  if(!f.moveOutDate) throw new Error('ระบุวันที่ย้ายออก');
+  const calc = calcMoveOutLines(f);
+  ['water','elec'].forEach(t=>{ if(calc[t] && calc[t].final!=null && calc[t].final < calc[t].prev) throw new Error('ค่ามิเตอร์'+(t==='water'?'น้ำ':'ไฟ')+'ที่ถ่าย ('+calc[t].final+') ต่ำกว่าค่าที่คิดเงินไปแล้ว ('+calc[t].prev+') — ตรวจตัวเลขอีกครั้ง'); });
+  const roomWSep = roomWaterMode(room)==='SEPARATE', roomESep = roomElecMode(room)==='SEPARATE';
+  if((roomWSep && calc.water.final==null) || (roomESep && calc.elec.final==null)) throw new Error('กรอกค่ามิเตอร์ที่ถ่ายในวันย้ายออกให้ครบ (น้ำ-ไฟ)');
+  const doc = {
+    leaseId: lease.id, roomId: lease.roomId, roomCode: lease.roomCode, propertyId: room.propertyId, propertyCode: prop?prop.code:'',
+    tenantId: lease.tenantId, tenantName: lease.tenantName, moveOutDate: f.moveOutDate, deposit: r2(f.deposit),
+    inputs: { unpaid:f.unpaid, unpaidNote:f.unpaidNote||'', rent:f.rent, rentNote:f.rentNote||'', cleaning:f.cleaning, cleaningNote:f.cleaningNote||'', other:f.other, otherNote:f.otherNote||'', waterFinal:f.waterFinal, elecFinal:f.elecFinal },
+    water: calc.water, elec: calc.elec, lines: calc.lines, deductionTotal: calc.deductionTotal, refund: calc.refund
+  };
+  if(existing){
+    await Store.update('moveOuts', existing.id, { ...doc, updatedAt: nowIso(), updatedBy: Session.user.name });
+    for(const t of ['water','elec']){
+      const c = calc[t]; if(!c || c.final==null) continue;
+      const rd = cache.meterReadings.find(r=>r.moveOutId===existing.id && r.type===t);
+      if(rd) await Store.update('meterReadings', rd.id, { value:c.final, usage:Math.max(0, c.final-Number(rd.previousValue||0)) });
+    }
+    await logAudit({action:'UPDATE_MOVEOUT', entityType:'moveOut', entityId:existing.id, newValue:{roomCode:doc.roomCode, refund:doc.refund}});
+    toast('บันทึกการแก้ไขสรุปคืนเงินมัดจำแล้ว','ok'); return existing.id;
+  }
+  const id = await Store.add('moveOuts', { ...doc, status:'DRAFT', createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
+    bank:null, accountMessages:[], lineSentAt:'', refundedAt:'' });
+  // end the lease, free the room
+  await Store.update('leases', lease.id, {active:false, endDate: f.moveOutDate, moveOutId:id});
+  await Store.update('rooms', lease.roomId, {status:'VACANT'});
+  // invoices settled from the deposit stop being chased
+  for(const x of moveOutOutstanding(lease.roomId)) await Store.update('invoices', x.inv.id, {moveOutId:id});
+  // move-out meter reading becomes the room's latest reading (the next tenant starts from it)
+  const period = f.moveOutDate.slice(0,4)+f.moveOutDate.slice(5,7);
+  for(const t of ['water','elec']){
+    const c = calc[t]; if(!c || c.final==null) continue;
+    // always its own document (a regular reading for the same month may already exist/be locked); the next tenant starts from the latest one
+    await Store.add('meterReadings', { roomId:lease.roomId, roomCode:lease.roomCode, type:t, period, previousValue:c.prev, usage:Math.max(0, c.final-c.prev), value:c.final, photoDataUrl:'', recordedBy:Session.user.id, recordedByName:Session.user.name, timestamp:nowIso(), editLog:[], moveOut:true, moveOutId:id, verificationStatus:'verified', locked:true, invoiceId:'moveout:'+id });
+  }
+  await logAudit({action:'END_LEASE', entityType:'lease', entityId:lease.id, oldValue:{active:true}, newValue:{active:false, moveOutId:id, moveOutDate:f.moveOutDate, deposit:doc.deposit, refund:doc.refund}});
+  toast('สิ้นสุดสัญญาห้อง '+lease.roomCode+' แล้ว — บันทึกสรุปคืนเงินมัดจำ (ยังไม่แจ้งลูกค้า)','ok');
+  return id;
+}
+function openMoveOutModal(lease, existing){
+  const room = roomById(lease.roomId);
+  const today = todayStr();
+  const date0 = existing ? existing.moveOutDate : today;
+  const inp = existing ? existing.inputs : null;
+  const def = moveOutDefaults(lease, date0);
+  const outst = existing ? [] : moveOutOutstanding(lease.roomId);
+  const outstTotal = r2(outst.reduce((s,x)=>s+x.rem,0));
+  const wSep = roomWaterMode(room)==='SEPARATE', eSep = roomElecMode(room)==='SEPARATE';
+  const wb = billedMeterBase(lease.roomId,'water'), eb = billedMeterBase(lease.roomId,'elec');
+  const v = (k, d) => inp && inp[k]!=null && inp[k]!=='' ? inp[k] : d;
+  const back = openModal({ title:(existing?'แก้ไขสรุปคืนเงินมัดจำ — ห้อง ':'สิ้นสุดสัญญา / คืนเงินมัดจำ — ห้อง ')+lease.roomCode, wide:true, submitLabel: existing?'บันทึกการแก้ไข':'สิ้นสุดสัญญาและบันทึกสรุป',
+    onSubmit: async fd=>{ await saveMoveOut(lease, readForm(fd), existing); },
+    bodyHtml:
+    '<div class="help-box">ผู้เช่า <b>'+escapeHtml(lease.tenantName)+'</b> · ถ่ายมิเตอร์น้ำ-ไฟวันย้ายออก ระบบคำนวณเงินมัดจำที่ต้องคืนให้ แก้ตัวเลขแต่ละรายการได้ ตรวจแล้วจึงกด "ส่งแจ้งลูกค้า" ที่หน้า สิ้นสุดสัญญา/คืนมัดจำ — ยังไม่ส่งข้อความอัตโนมัติ'+(existing?'':'<br>เมื่อกดบันทึก สัญญาจะสิ้นสุดและห้องกลายเป็นห้องว่าง')+'</div>'+
+    '<div class="field-row"><div class="field"><label>วันที่ย้ายออก</label><input name="moveOutDate" type="date" required value="'+date0+'" '+(existing?'':'max="'+today+'"')+'></div>'+
+    '<div class="field"><label>เงินมัดจำที่รับไว้ (บาท)</label><input name="deposit" type="number" min="0" step="0.01" required value="'+(existing?existing.deposit:leaseDeposit(lease))+'">'+
+    '<p class="hint">'+(lease.deposit!=null&&lease.deposit!==''?'ตามสัญญา':'ยังไม่ได้ระบุในสัญญา — ใช้ค่าเริ่มต้น = ค่าเช่า 1 เดือน (แก้ได้)')+'</p></div></div>'+
+    '<h4 style="margin:12px 0 4px;">มิเตอร์วันย้ายออก</h4>'+
+    '<div class="field-row">'+
+      (wSep?'<div class="field"><label>มิเตอร์น้ำ ที่ถ่าย (ค่าที่คิดเงินแล้ว '+(wb?wb.value:'-')+')</label><input name="waterFinal" type="number" step="0.01" min="0" required value="'+v('waterFinal','')+'"><p class="hint" id="moWaterHint"></p></div>':'<div class="field"><label>น้ำประปา</label><input disabled value="รวมค่าเช่า/เหมาจ่าย — ไม่ต้องถ่ายมิเตอร์"></div>')+
+      (eSep?'<div class="field"><label>มิเตอร์ไฟ ที่ถ่าย (ค่าที่คิดเงินแล้ว '+(eb?eb.value:'-')+')</label><input name="elecFinal" type="number" step="0.01" min="0" required value="'+v('elecFinal','')+'"><p class="hint" id="moElecHint"></p></div>':'<div class="field"><label>ไฟฟ้า</label><input disabled value="รวมค่าเช่า — ไม่ต้องถ่ายมิเตอร์"></div>')+
+    '</div>'+
+    '<h4 style="margin:12px 0 4px;">รายการหักจากเงินมัดจำ</h4>'+
+    '<div class="field-row"><div class="field"><label>ยอดค้างชำระเดิม (บาท)</label><input name="unpaid" type="number" min="0" step="0.01" value="'+v('unpaid', outstTotal)+'">'+
+      '<p class="hint">'+(existing?'':(outst.length? 'ใบแจ้งหนี้ค้าง: '+outst.map(x=>escapeHtml(x.inv.invoiceNumber||periodLabel(x.inv.period))+' '+money(x.rem)).join(', ')+' — ระบบจะไม่ทวงใบเหล่านี้อีก (หักจากมัดจำ)' : 'ไม่มียอดค้างชำระ'))+'</p></div>'+
+    '<div class="field"><label>ค่าเช่าถึงวันย้ายออก (บาท)</label><input name="rent" type="number" min="0" step="0.01" value="'+v('rent', def.rentInfo.amount)+'"><p class="hint" id="moRentHint"></p></div></div>'+
+    '<div class="field-row"><div class="field"><label>ค่าทำความสะอาด/ค่าซ่อม (บาท)</label><input name="cleaning" type="number" min="0" step="0.01" value="'+v('cleaning',0)+'"></div>'+
+    '<div class="field"><label>รายละเอียดค่าทำความสะอาด/ซ่อม</label><input name="cleaningNote" value="'+escapeHtml(v('cleaningNote',''))+'" placeholder="เช่น ทาสีผนัง, ซ่อมประตู"></div></div>'+
+    '<div class="field-row"><div class="field"><label>รายการอื่นๆ (บาท) — บวก = หักเพิ่ม, ลบ = คืนเพิ่ม</label><input name="other" type="number" step="0.01" value="'+v('other',0)+'"></div>'+
+    '<div class="field"><label>รายละเอียด</label><input name="otherNote" value="'+escapeHtml(v('otherNote',''))+'" placeholder="เช่น คืนค่าเช่าที่จ่ายล่วงหน้าเกินวันย้ายออก"></div></div>'+
+    '<div id="moSummary" class="help-box" style="margin-top:10px;"></div>' });
+  const num = (fd,k)=> Number(fd.get(k)||0);
+  function readForm(fd){
+    return { roomId:lease.roomId, moveOutDate:fd.get('moveOutDate'), deposit:num(fd,'deposit'), waterFinal:fd.get('waterFinal')===null?'':fd.get('waterFinal'), elecFinal:fd.get('elecFinal')===null?'':fd.get('elecFinal'),
+      unpaid:num(fd,'unpaid'), unpaidNote:'', rent:num(fd,'rent'), rentNote:rentNoteOf(fd.get('moveOutDate')), cleaning:num(fd,'cleaning'), cleaningNote:(fd.get('cleaningNote')||'').trim(), other:num(fd,'other'), otherNote:(fd.get('otherNote')||'').trim() };
+  }
+  function rentNoteOf(date){ const d = moveOutDefaults(lease, date||date0).rentInfo; return d.days? d.days+' วัน ('+fmtThaiDate(d.from)+' – '+fmtThaiDate(date)+')' : ''; }
+  const form = $('#modalForm', back);
+  function refresh(touchRent){
+    const fd = new FormData(form); const date = fd.get('moveOutDate')||date0;
+    const d = moveOutDefaults(lease, date).rentInfo;
+    if(touchRent){ const el = form.elements['rent']; el.value = d.amount; }
+    $('#moRentHint', back).textContent = d.days ? 'คิดจาก '+fmtThaiDate(d.from)+' ถึง '+fmtThaiDate(date)+' ('+d.days+' วัน) · ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough) : 'ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough)+' — ไม่มีค่าเช่าเพิ่ม (ถ้าจ่ายล่วงหน้าเกินวันย้ายออก ใส่ค่าติดลบที่ "รายการอื่นๆ")';
+    const f = readForm(fd); const c = calcMoveOutLines(f);
+    if($('#moWaterHint',back)) $('#moWaterHint',back).textContent = c.water && c.water.final!=null ? 'ใช้ '+c.water.units+' หน่วย = '+money(c.water.amount)+' บาท' : '';
+    if($('#moElecHint',back)) $('#moElecHint',back).textContent = c.elec && c.elec.final!=null ? 'ใช้ '+c.elec.units+' หน่วย = '+money(c.elec.amount)+' บาท' : '';
+    $('#moSummary', back).innerHTML = '<b>สรุป</b><br>เงินมัดจำ '+money(f.deposit)+' − รวมหัก '+money(c.deductionTotal)+' = '+
+      (c.refund>=0 ? '<b style="font-size:16px;">คืนลูกค้า '+money(c.refund)+' บาท</b>' : '<b style="font-size:16px;color:var(--danger);">ลูกค้าต้องชำระเพิ่ม '+money(-c.refund)+' บาท</b>')+
+      (c.lines.length? '<div style="font-size:12.5px;margin-top:6px;">'+c.lines.map(l=>escapeHtml(l.label)+': '+money(l.amount)).join('<br>')+'</div>':'');
+  }
+  form.addEventListener('input', e=>refresh(false));
+  form.elements['moveOutDate'].addEventListener('change', ()=>refresh(!existing));
+  refresh(false);
+}
+
+/* ---------- VIEW: move-outs ---------- */
+function renderMoveOuts(root){
+  const rows = cache.moveOuts.slice().sort((a,b)=>(b.createdAt||'')<(a.createdAt||'')?-1:1)
+    .filter(m=>selectedPropertyId==='ALL' || m.propertyId===selectedPropertyId);
+  const open = rows.filter(m=>!['REFUNDED','SETTLED'].includes(m.status));
+  const done = rows.filter(m=>['REFUNDED','SETTLED'].includes(m.status));
+  root.innerHTML =
+    '<div class="section-title"><div><h2>สิ้นสุดสัญญา / คืนเงินมัดจำ</h2><div class="desc">ถ่ายมิเตอร์วันย้ายออก → คำนวณเงินมัดจำที่ต้องคืน → ADMIN/OWNER ตรวจแล้วกดส่งแจ้งลูกค้าในกลุ่มไลน์ พร้อมขอเลขบัญชี → บันทึกเลขบัญชี → โอนคืนแล้วบันทึกผล · เริ่มจากปุ่ม "สิ้นสุดสัญญา" ที่หน้า ห้องพัก &amp; ผู้เช่า</div></div></div>'+
+    '<div class="card"><div class="card-head"><h3>กำลังดำเนินการ ('+open.length+')</h3></div><div id="moOpen"></div></div>'+
+    '<div class="card"><div class="card-head"><h3>เสร็จสิ้นแล้ว</h3></div><div id="moDone"></div></div>';
+  const card = m => {
+    const lines = (m.lines||[]).map(l=>'<tr><td>'+escapeHtml(l.label)+'</td><td class="num">'+(l.amount<0?'−':'')+money(Math.abs(l.amount))+'</td></tr>').join('');
+    const b = m.bank;
+    const refundTxt = m.refund>0 ? '<b>คืนลูกค้า '+money(m.refund)+' บาท</b>' : (m.refund<0 ? '<b style="color:var(--danger);">ลูกค้าต้องชำระเพิ่ม '+money(-m.refund)+' บาท</b>' : '<b>ไม่มียอดคืน</b>');
+    const msgs = (m.accountMessages||[]).slice(-3);
+    const act = [];
+    if(can('MANAGE_ROOMS')){
+      if(m.status==='DRAFT') act.push('<button class="btn sm" data-moedit="'+m.id+'">แก้ไขตัวเลข</button>');
+      if(['DRAFT'].includes(m.status) && can('SEND_BILLS')) act.push('<button class="btn sm primary" data-mosend="'+m.id+'">ตรวจข้อความและส่งแจ้งลูกค้า</button>');
+      if(m.status!=='DRAFT' && m.refund>0 && !['REFUNDED','SETTLED'].includes(m.status) && can('SEND_BILLS')) act.push('<button class="btn sm" data-moask="'+m.id+'">ส่งขอเลขบัญชีอีกครั้ง</button>');
+      if(['NOTIFIED','ACCOUNT_RECEIVED'].includes(m.status) && m.refund>0) act.push('<button class="btn sm'+(m.status==='NOTIFIED'?' primary':'')+'" data-mobank="'+m.id+'">'+(b?'แก้ไขเลขบัญชี':'บันทึกเลขบัญชีลูกค้า')+'</button>');
+      if(m.status==='ACCOUNT_RECEIVED') act.push('<button class="btn sm primary" data-morefund="'+m.id+'">บันทึกโอนคืนแล้ว</button>');
+      if(['NOTIFIED'].includes(m.status) && m.refund<=0) act.push('<button class="btn sm primary" data-moclose="'+m.id+'">'+(m.refund<0?'บันทึกรับชำระส่วนที่ขาดแล้ว':'ปิดรายการ')+'</button>');
+    }
+    return '<div class="alert-row" style="align-items:flex-start;"><div style="flex:1;min-width:0;">'+
+      '<div class="alert-title">ห้อง '+escapeHtml(m.roomCode)+' · '+escapeHtml(m.tenantName||'')+' <span class="pill '+MOVEOUT_PILL[m.status]+'">'+MOVEOUT_STATUS[m.status]+'</span></div>'+
+      '<div class="alert-detail">ย้ายออก '+fmtThaiDate(m.moveOutDate)+' · เงินมัดจำ '+money(m.deposit)+' · รวมหัก '+money(m.deductionTotal)+' → '+refundTxt+'</div>'+
+      (lines? '<table class="grid" style="margin:8px 0;max-width:560px;"><tbody>'+lines+'</tbody></table>':'')+
+      (b? '<div class="alert-detail">บัญชีรับเงินคืน: '+escapeHtml(b.bankName)+' · '+escapeHtml(b.accountNo)+' · '+escapeHtml(b.accountName)+(b.note?' · '+escapeHtml(b.note):'')+'</div>':'')+
+      (msgs.length? '<div class="alert-meta" style="margin-top:4px;">ลูกค้าตอบในกลุ่ม: '+msgs.map(x=>'“'+escapeHtml(x.text||('['+(x.type||'ข้อความ')+']'))+'” ('+fmtDateTime(x.at)+')').join(' · ')+'</div>':'')+
+      (m.lineSentAt? '<div class="alert-meta">แจ้งลูกค้าแล้ว '+fmtDateTime(m.lineSentAt)+(m.lineSentByName?' โดย '+escapeHtml(m.lineSentByName):'')+'</div>':'')+
+      (m.refundedAt? '<div class="alert-meta">โอนคืน '+money(m.refundAmount||m.refund)+' บาท เมื่อ '+fmtThaiDate(m.refundDate||'')+(m.refundRef?' · '+escapeHtml(m.refundRef):'')+' · บันทึกโดย '+escapeHtml(m.refundedByName||'')+'</div>':'')+
+      '</div><div class="tag-row" style="flex-wrap:wrap;justify-content:flex-end;">'+act.join('')+'</div></div>';
+  };
+  $('#moOpen').innerHTML = open.length ? open.map(card).join('') : '<div class="empty-row">ไม่มีรายการที่กำลังดำเนินการ</div>';
+  $('#moDone').innerHTML = done.length ? done.map(card).join('') : '<div class="empty-row">ยังไม่มีรายการ</div>';
+  const find = id => cache.moveOuts.find(x=>x.id===id);
+  $all('[data-moedit]', root).forEach(b=>b.addEventListener('click', ()=>{ const m = find(b.dataset.moedit); openMoveOutModal({id:m.leaseId, roomId:m.roomId, roomCode:m.roomCode, tenantId:m.tenantId, tenantName:m.tenantName, rent:(roomById(m.roomId)||{}).rent, deposit:m.deposit}, m); }));
+  $all('[data-mosend]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutSendModal(find(b.dataset.mosend),'summary')));
+  $all('[data-moask]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutSendModal(find(b.dataset.moask),'account')));
+  $all('[data-mobank]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutBankModal(find(b.dataset.mobank))));
+  $all('[data-morefund]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutRefundModal(find(b.dataset.morefund))));
+  $all('[data-moclose]', root).forEach(b=>b.addEventListener('click', ()=>{ const m = find(b.dataset.moclose);
+    confirmModal({title:'ปิดรายการ — ห้อง '+m.roomCode, submitLabel:'ปิดรายการ', bodyHtml:'<p>'+(m.refund<0?'ยืนยันว่าได้รับชำระส่วนที่ขาด '+money(-m.refund)+' บาท จากลูกค้าแล้ว?':'ยืนยันปิดรายการ (ไม่มียอดคืน)?')+'</p>',
+      onSubmit: async ()=>{ await Store.update('moveOuts', m.id, {status:'SETTLED', settledAt:nowIso(), settledByName:Session.user.name}); await logAudit({action:'SETTLE_MOVEOUT', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, refund:m.refund}}); toast('ปิดรายการแล้ว','ok'); }}); }));
+}
+async function openMoveOutSendModal(m, kind){
+  let text = '';
+  try{ text = (await lineCall('moveout_send', {id:m.id, kind, dry:true})).text; }catch(e){ toast(e.message,'err'); return; }
+  const titles = {summary:'ส่งสรุปคืนเงินมัดจำเข้ากลุ่มไลน์', account:'ส่งขอเลขบัญชีอีกครั้ง', refunded:'แจ้งโอนคืนเงินมัดจำแล้ว'};
+  openModal({ title:titles[kind]+' — ห้อง '+m.roomCode, wide:true, submitLabel:'ส่งเข้ากลุ่มไลน์ห้องนี้', onSubmit: async ()=>{
+    const r = await lineCall('moveout_send', {id:m.id, kind});
+    await logAudit({action:'SEND_MOVEOUT_'+kind.toUpperCase(), entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode}});
+    toast('ส่งข้อความเข้ากลุ่มห้อง '+m.roomCode+' แล้ว','ok');
+  }, bodyHtml:'<div class="help-box">ตรวจข้อความด้านล่างให้ถูกต้องก่อนส่ง (ส่งเข้ากลุ่มไลน์ของห้องนี้) — ถ้าห้องยังไม่ผูกกลุ่มไลน์ ระบบจะแจ้งเตือน และคัดลอกข้อความนี้ไปส่งเองได้</div>'+
+    '<textarea readonly style="width:100%;min-height:260px;font-family:inherit;">'+escapeHtml(text)+'</textarea>' });
+}
+function openMoveOutBankModal(m){
+  const b = m.bank||{}; const msgs = (m.accountMessages||[]);
+  openModal({ title:'เลขบัญชีรับเงินคืน — ห้อง '+m.roomCode, submitLabel:'บันทึกเลขบัญชี', onSubmit: async fd=>{
+    const bankName = fd.get('bankName'); const accountNo = (fd.get('accountNo')||'').trim(); const accountName = (fd.get('accountName')||'').trim();
+    if(!accountNo || !/^[0-9\- ]{6,20}$/.test(accountNo)) throw new Error('เลขบัญชีไม่ถูกต้อง (ตัวเลข 6–20 หลัก)');
+    if(!accountName) throw new Error('ระบุชื่อบัญชี');
+    await Store.update('moveOuts', m.id, { bank:{bankName, accountNo, accountName, note:(fd.get('note')||'').trim(), savedBy:Session.user.name, savedAt:nowIso()}, status: m.status==='NOTIFIED'?'ACCOUNT_RECEIVED':m.status });
+    await logAudit({action:'SAVE_MOVEOUT_BANK', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, bankName}});
+    toast('บันทึกเลขบัญชีแล้ว','ok');
+  }, bodyHtml:
+    (msgs.length? '<div class="help-box"><b>ลูกค้าตอบในกลุ่มไลน์:</b><br>'+msgs.map(x=>escapeHtml(x.text||('['+(x.type||'ข้อความ')+' — ดูในกลุ่มไลน์]'))+' <span class="footnote">('+fmtDateTime(x.at)+')</span>').join('<br>')+'</div>' : '<div class="help-box">ยังไม่มีข้อความตอบกลับในระบบ — ถ้าลูกค้าส่งเลขบัญชีเป็นรูปหรือทางอื่น ให้กรอกตามที่ได้รับ</div>')+
+    '<div class="field"><label>ธนาคาร</label><select name="bankName">'+THAI_BANKS.map(x=>'<option '+(x===b.bankName?'selected':'')+'>'+x+'</option>').join('')+'</select></div>'+
+    '<div class="field-row"><div class="field"><label>เลขบัญชี</label><input name="accountNo" required value="'+escapeHtml(b.accountNo||'')+'" inputmode="numeric"></div>'+
+    '<div class="field"><label>ชื่อบัญชี</label><input name="accountName" required value="'+escapeHtml(b.accountName||'')+'"></div></div>'+
+    '<div class="field"><label>หมายเหตุ</label><input name="note" value="'+escapeHtml(b.note||'')+'" placeholder="เช่น พร้อมเพย์เบอร์..."></div>'+
+    '<p class="hint">ควรตรวจชื่อบัญชีกับผู้เช่าก่อนโอน (ลูกค้าส่งในกลุ่มไลน์ผู้เช่าเอง)</p>' });
+}
+function openMoveOutRefundModal(m){
+  const b = m.bank;
+  openModal({ title:'บันทึกโอนคืนเงินมัดจำ — ห้อง '+m.roomCode, submitLabel:'บันทึกว่าโอนคืนแล้ว', onSubmit: async fd=>{
+    const amount = Number(fd.get('amount')); if(!(amount>0)) throw new Error('ระบุยอดที่โอนคืน');
+    if(!fd.get('confirm')) throw new Error('ติ๊กยืนยันว่าโอนเงินคืนแล้ว');
+    let slip = ''; const f = fd.get('slip'); if(f && f.size>0) slip = await fileToCompressedDataUrl(f);
+    await Store.update('moveOuts', m.id, { status:'REFUNDED', refundedAt:nowIso(), refundedBy:Session.user.id, refundedByName:Session.user.name, refundAmount:amount, refundDate:fd.get('date'), refundRef:(fd.get('ref')||'').trim(), refundSlip:slip });
+    await logAudit({action:'REFUND_DEPOSIT', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, amount, date:fd.get('date')}});
+    toast('บันทึกโอนคืนเงินมัดจำแล้ว','ok');
+    if(fd.get('notify')){ try{ await lineCall('moveout_send', {id:m.id, kind:'refunded'}); toast('แจ้งในกลุ่มไลน์แล้ว','ok'); }catch(e){ toast('บันทึกแล้ว แต่ส่งข้อความเข้ากลุ่มไม่สำเร็จ: '+e.message,'warn'); } }
+  }, bodyHtml:
+    '<div class="help-box">ระบบนี้ไม่โอนเงินให้ — โอนเงินเองที่แอปธนาคาร แล้วกลับมาบันทึกที่นี่'+(b?'<br>บัญชีปลายทาง: <b>'+escapeHtml(b.bankName)+' '+escapeHtml(b.accountNo)+' '+escapeHtml(b.accountName)+'</b>':'')+'</div>'+
+    '<div class="field-row"><div class="field"><label>ยอดที่โอนคืน (บาท)</label><input name="amount" type="number" step="0.01" min="0" required value="'+m.refund+'"></div>'+
+    '<div class="field"><label>วันที่โอน</label><input name="date" type="date" required value="'+todayStr()+'"></div></div>'+
+    '<div class="field"><label>เลขอ้างอิง/หมายเหตุ</label><input name="ref"></div>'+
+    '<div class="field"><label>รูปสลิปโอนคืน (ถ้ามี)</label><input name="slip" type="file" accept="image/*"></div>'+
+    '<label style="display:flex;gap:8px;align-items:center;font-weight:400;margin:6px 0;"><input type="checkbox" name="confirm" style="width:auto;"> ฉันโอนเงินคืนลูกค้าแล้ว</label>'+
+    '<label style="display:flex;gap:8px;align-items:center;font-weight:400;"><input type="checkbox" name="notify" style="width:auto;" checked> แจ้งยืนยันในกลุ่มไลน์ห้องนี้ด้วย</label>' });
 }
 
 /* ============================================================
