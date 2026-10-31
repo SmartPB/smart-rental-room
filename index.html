@@ -767,7 +767,7 @@ async function createTenantAndLease(data){
     idCardPhotoUrl:data.idCardPhotoUrl||'', active:true, createdAt: nowIso()});
   const leaseId = await Store.add('leases', {
     roomId:data.roomId, roomCode:data.roomCode, tenantId, tenantName:data.name, rent:data.rent, deposit: data.deposit!=null? Number(data.deposit): Number(data.rent||0),
-    startDate:data.startDate, endDate:null, active:true, contractPhotoUrl:data.contractPhotoUrl||'', createdAt: nowIso()
+    startDate:data.startDate, termMonths: data.termMonths>0? Number(data.termMonths): null, termEndDate: data.termMonths>0? leaseTermEnd(data.startDate, data.termMonths): '', endDate:null, active:true, contractPhotoUrl:data.contractPhotoUrl||'', createdAt: nowIso()
   });
   await Store.update('rooms', data.roomId, {status:'OCCUPIED'});
   await logAudit({action:'CREATE_LEASE', entityType:'lease', entityId:leaseId,
@@ -1747,7 +1747,7 @@ function renderRooms(root){
       '<span class="pill '+(roomElecMode(r)==='SEPARATE'?'muted':'info')+'" style="padding:1px 6px;margin-top:2px;">ไฟ: '+ELEC_MODE_LABEL[roomElecMode(r)]+'</span></td>'+
       '<td>'+statusPill(r.status)+'</td>'+
       '<td>'+(lease? escapeHtml(lease.tenantName) : (r.status==='RESERVED'? '<span class="pill info">มีผู้จองแล้ว</span>' : '<span class="pill muted">ไม่มีผู้เช่า</span>'))+'</td>'+
-      '<td style="white-space:nowrap;">'+(lease? leaseDurationLabel(lease)+'<div class="footnote">ตั้งแต่ '+fmtDate(lease.startDate)+'</div>' : '-')+'</td>'+
+      '<td style="white-space:nowrap;">'+(lease? leaseDurationLabel(lease)+'<div class="footnote">ตั้งแต่ '+fmtDate(lease.startDate)+'</div>'+(lease.termMonths? (()=>{ const ti = leaseTermInfo(lease.startDate, lease.termMonths); return '<div class="footnote">สัญญา '+lease.termMonths+' เดือน · ครบ '+fmtDate(ti.end)+(ti.renewals? ' (ต่อสัญญาแล้ว '+ti.renewals+' ครั้ง)':'')+'</div>'; })(): '<div class="footnote">ยังไม่ระบุอายุสัญญา</div>') : '-')+'</td>'+
       '<td class="num">'+money(r.rent)+'</td>'+
       '<td class="num">'+money(r.commonFee||0)+'</td>'+
       '<td style="text-align:right;white-space:nowrap;">'+
@@ -1884,13 +1884,14 @@ function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhon
     if(!contractFile || !contractFile.size) throw new Error('กรุณาแนบรูปถ่ายสัญญาเช่า');
     const idCardPhotoUrl = await fileToCompressedDataUrl(idFile);
     const contractPhotoUrl = await fileToCompressedDataUrl(contractFile);
-    await onSubmit({name, address, phone, rent:Number(fd.get('rent')), deposit:Number(fd.get('deposit')||0), startDate:fd.get('startDate'), idCardPhotoUrl, contractPhotoUrl});
+    await onSubmit({name, address, phone, rent:Number(fd.get('rent')), deposit:Number(fd.get('deposit')||0), startDate:fd.get('startDate'), termMonths:Number(fd.get('termMonths')||0), idCardPhotoUrl, contractPhotoUrl});
   }, bodyHtml:
     '<div class="field"><label>ชื่อ-สกุลผู้เช่า (*บังคับ)</label><input name="name" required value="'+escapeHtml(prefillName||'')+'"></div>'+
     '<div class="field"><label>ที่อยู่ (*บังคับ)</label><textarea name="address" required placeholder="ที่อยู่ตามบัตรประชาชนหรือที่อยู่ปัจจุบัน"></textarea></div>'+
     '<div class="field"><label>เบอร์โทร (*บังคับ)</label><input name="phone" required placeholder="08x-xxx-xxxx" value="'+escapeHtml(prefillPhone||'')+'"></div>'+
     '<div class="field-row"><div class="field"><label>ค่าเช่า (บาท) — ตามค่า default (แก้ไขได้)</label><input name="rent" type="number" required value="'+room.rent+'"></div>'+
     '<div class="field"><label>วันที่เข้าพัก</label><input name="startDate" type="date" required value="'+todayStr()+'"></div></div>'+
+    '<div class="field"><label>ระยะเวลาสัญญาเช่า (เดือน) (*บังคับ)</label><select name="termMonths" required>'+[1,2,3,4,5,6,7,8,9,10,11,12,18,24,36].map(n=>'<option value="'+n+'" '+(n===12?'selected':'')+'>'+n+' เดือน'+(n===12?' (ค่าเริ่มต้น)':'')+'</option>').join('')+'</select><p class="hint">ถ้าผู้เช่าย้ายออกก่อนครบสัญญา จะไม่คืนเงินมัดจำ · เมื่อครบสัญญาแล้วยังไม่ย้ายออก สัญญาต่ออัตโนมัติด้วยระยะเวลาเท่าเดิม</p></div>'+
     '<div class="field"><label>เงินมัดจำที่รับ (บาท) — ปกติ 1 เดือนของค่าเช่า</label><input name="deposit" type="number" min="0" step="0.01" value="'+(prefillDeposit!=null?prefillDeposit:room.rent)+'"><p class="hint">ใช้คำนวณเงินคืนตอนสิ้นสุดสัญญา</p></div>'+
     '<div class="field"><label>รูปถ่ายบัตรประชาชน (*บังคับ)</label><input name="idCardPhoto" type="file" accept="image/*" capture="environment" required>'+
     '<p class="hint">'+icon('camera')+' ถ่ายรูปบัตรประชาชนผู้เช่าหรือแนบไฟล์รูป ระบบจะบีบอัดไฟล์อัตโนมัติ</p></div>'+
@@ -2884,10 +2885,15 @@ async function renderSlipPanelAt(sel){
         const owed = openInvoicesOf(sl.roomId).reduce((s,x)=>s+x.rem,0);
         return '<tr'+(sl.notSlip?' style="opacity:.6;"':'')+'><td><b>'+escapeHtml(sl.roomCode)+'</b>'+(sl.notSlip?'<div><span class="pill muted">อาจไม่ใช่สลิป</span></div>':'')+'</td><td>'+fmtDateTime(sl.createdAt)+'</td><td class="num">'+(sl.suggestedAmount? money(sl.suggestedAmount):'<span class="pill muted">ไม่ทราบ — ดูจากรูป</span>')+'</td><td class="num">'+money(owed)+'</td>'+
           '<td style="font-size:12px;">'+((sl.flags||[]).map(f=>'<div style="color:var(--danger);">⚠ '+escapeHtml(f)+'</div>').join('') || '-')+(sl.status==='approved'?'<div>ยืนยัน '+money(sl.approvedAmount)+' โดย '+escapeHtml(sl.approvedByName||'')+' · '+escapeHtml((sl.receipts||[]).join(', '))+'</div>':'')+(sl.status==='rejected'?'<div>'+escapeHtml(sl.rejectReason||'')+' · '+escapeHtml(sl.rejectedByName||'')+'</div>':'')+'</td>'+
-          '<td>'+stPill[sl.status]+'</td><td style="text-align:right;white-space:nowrap;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">อนุมัติ</button> <button class="btn sm danger" data-slipcancel="'+sl.id+'">ยกเลิก</button>':'')+'</td></tr>';
+          '<td>'+stPill[sl.status]+'</td><td style="text-align:right;white-space:nowrap;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">อนุมัติ</button> <button class="btn sm" data-slipnot="'+sl.id+'" title="รูปที่ไม่ใช่สลิป — ปิดรายการ โดยไม่ส่งข้อความเข้ากลุ่ม">ไม่ใช่สลิป</button> <button class="btn sm danger" data-slipcancel="'+sl.id+'">ยกเลิก</button>':'')+'</td></tr>';
       }).join('')+'</tbody></table></div>' : '<div class="empty-row" style="padding:18px;">'+(SlipUi.status==='pending'?'ไม่มีสลิปรอตรวจสอบ':'ไม่มีรายการ')+'</div>')+'</div>';
   $('#slipStSel', host).addEventListener('change', e=>{ SlipUi.status = e.target.value; renderSlipPanel(); });
   $all('[data-slip]', host).forEach(b=>b.addEventListener('click', ()=>openSlipReviewModal(slips.find(x=>x.id===b.dataset.slip))));
+  $all('[data-slipnot]', host).forEach(b=>b.addEventListener('click', async ()=>{
+    const sl = slips.find(x=>x.id===b.dataset.slipnot); b.disabled = true;
+    try{ await lineCall('slip_reject', {slipId: sl.id, reason:'ไม่ใช่สลิปโอนเงิน', notify:false}); await logAudit({action:'DISMISS_NOT_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode}}); toast('ปิดรายการแล้ว (ไม่ส่งข้อความเข้ากลุ่ม)','ok'); renderSlipPanel(); }
+    catch(e){ toast(e.message,'err'); b.disabled = false; }
+  }));
   $all('[data-slipcancel]', host).forEach(b=>b.addEventListener('click', ()=>openSlipRejectModal(slips.find(x=>x.id===b.dataset.slipcancel))));
 }
 async function openSlipReviewModal(sl){
@@ -3190,6 +3196,18 @@ const MOVEOUT_STATUS = { DRAFT:'ยังไม่แจ้งลูกค้า
 const MOVEOUT_PILL = { DRAFT:'warn', NOTIFIED:'info', ACCOUNT_RECEIVED:'warn', REFUNDED:'ok', SETTLED:'ok' };
 const THAI_BANKS = ['ธนาคารกสิกรไทย','ธนาคารไทยพาณิชย์','ธนาคารกรุงเทพ','ธนาคารกรุงไทย','ธนาคารกรุงศรีอยุธยา','ธนาคารทหารไทยธนชาต (ttb)','ธนาคารออมสิน','ธนาคาร ธ.ก.ส.','ธนาคารอื่นๆ (ระบุในหมายเหตุ)'];
 const r2 = n => Math.round(Number(n||0)*100)/100;
+function addMonthsYmd(ymd, n){ const [y,m,d]=ymd.split('-').map(Number); const dim=new Date(y,m-1+n+1,0).getDate(); return ymdLocal(new Date(y, m-1+n, Math.min(d,dim))); }
+/* last day of the contract term: start + N months - 1 day (12 months from 1 Jan -> 31 Dec) */
+function leaseTermEnd(startYmd, months){ const m=Number(months); if(!startYmd || !(m>0)) return ''; const e = new Date(addMonthsYmd(startYmd, m)+'T00:00:00'); e.setDate(e.getDate()-1); return ymdLocal(e); }
+/* The contract renews itself for the same number of months when it ends and the tenant is still there.
+   -> the "current term" on `ref` is the first term whose last day is on/after `ref`; leaving before that day = before the end of the term. */
+function leaseTermInfo(startYmd, months, ref){
+  const m = Number(months); if(!startYmd || !(m>0)) return null;
+  ref = ref || todayStr();
+  let k = 0, end = leaseTermEnd(startYmd, m);
+  while(ref > end && k < 240){ k++; const e = new Date(addMonthsYmd(startYmd, m*(k+1))+'T00:00:00'); e.setDate(e.getDate()-1); end = ymdLocal(e); }
+  return { end, renewals:k, start: k? addMonthsYmd(startYmd, m*k) : startYmd };
+}
 function leaseDeposit(l){ return (l && l.deposit!=null && l.deposit!=='') ? Number(l.deposit) : Number((l&&l.rent)||0); }
 function ymdLocal(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 function fmtThaiDate(ymd){ if(!ymd) return '-'; const [y,m,d]=ymd.split('-').map(Number); const mn=['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.']; return d+' '+mn[m-1]+' '+(y+543); }
@@ -3245,8 +3263,20 @@ function calcMoveOutLines(f){
   if(f.rent>0) lines.push({key:'rent', label:'ค่าเช่าถึงวันย้ายออก'+(f.rentNote?' ('+f.rentNote+')':''), amount:r2(f.rent)});
   if(f.cleaning>0) lines.push({key:'cleaning', label:'ค่าทำความสะอาด/ค่าซ่อม'+(f.cleaningNote?' ('+f.cleaningNote+')':''), amount:r2(f.cleaning)});
   if(f.other && Number(f.other)!==0) lines.push({key:'other', label:(Number(f.other)>0?'หักอื่นๆ':'คืนเพิ่ม/ปรับปรุง')+(f.otherNote?' ('+f.otherNote+')':''), amount:r2(f.other)});
+  // left before the end of the contract term -> the deposit is not returned (what is left after the bills above is kept)
+  out.forfeit = 0;
+  if(f.forfeit && !(f.manualRefund!=null && f.manualRefund!=='')){
+    const before = r2(lines.reduce((s,l)=>s+l.amount,0)); const keep = r2(Math.max(0, Number(f.deposit||0) - before));
+    if(keep>0){ out.forfeit = keep; lines.push({key:'forfeit', label:'ไม่คืนเงินมัดจำ — ย้ายออกก่อนครบสัญญา'+(f.termEnd?' (สัญญาครบ '+fmtThaiDate(f.termEnd)+')':''), amount:keep}); }
+  }
   out.deductionTotal = r2(lines.reduce((s,l)=>s+l.amount,0));
   out.refund = r2(Number(f.deposit||0) - out.deductionTotal);
+  // old contract without a term: the admin decides the refund; a balancing line keeps the breakdown adding up
+  if(f.manualRefund!=null && f.manualRefund!==''){
+    const want = r2(Number(f.manualRefund)); const adj = r2(Number(f.deposit||0) - want - out.deductionTotal);
+    if(adj!==0) lines.push({key:'manual', label: adj>0 ? 'หักอื่นๆ (ผู้ดูแลระบุยอดคืนเอง)' : 'ปรับปรุงเพิ่ม (ผู้ดูแลระบุยอดคืนเอง)', amount:adj});
+    out.deductionTotal = r2(lines.reduce((s,l)=>s+l.amount,0)); out.refund = want; out.manual = true;
+  }
   return out;
 }
 async function saveMoveOut(lease, f, existing){
@@ -3254,12 +3284,13 @@ async function saveMoveOut(lease, f, existing){
   if(!f.moveOutDate) throw new Error('ระบุวันที่ย้ายออก');
   const calc = calcMoveOutLines(f);
   ['water','elec'].forEach(t=>{ if(calc[t] && calc[t].final!=null && calc[t].final < calc[t].prev) throw new Error('ค่ามิเตอร์'+(t==='water'?'น้ำ':'ไฟ')+'ที่ถ่าย ('+calc[t].final+') ต่ำกว่าค่าที่คิดเงินไปแล้ว ('+calc[t].prev+') — ตรวจตัวเลขอีกครั้ง'); });
+  if(!(f.termMonths>0) && (f.manualRefund==null || f.manualRefund==='' || !(Number(f.manualRefund)>=0))) throw new Error('สัญญานี้ไม่ได้ระบุอายุสัญญา — กรอกจำนวนเงินที่จะคืนลูกค้า (0 ถ้าไม่คืน) หรือระบุอายุสัญญา');
   const roomWSep = roomWaterMode(room)==='SEPARATE', roomESep = roomElecMode(room)==='SEPARATE';
   if((roomWSep && calc.water.final==null) || (roomESep && calc.elec.final==null)) throw new Error('กรอกค่ามิเตอร์ที่ถ่ายในวันย้ายออกให้ครบ (น้ำ-ไฟ)');
   const doc = {
     leaseId: lease.id, roomId: lease.roomId, roomCode: lease.roomCode, propertyId: room.propertyId, propertyCode: prop?prop.code:'',
     tenantId: lease.tenantId, tenantName: lease.tenantName, moveOutDate: f.moveOutDate, deposit: r2(f.deposit),
-    inputs: { unpaid:f.unpaid, unpaidNote:f.unpaidNote||'', rent:f.rent, rentNote:f.rentNote||'', cleaning:f.cleaning, cleaningNote:f.cleaningNote||'', other:f.other, otherNote:f.otherNote||'', waterFinal:f.waterFinal, elecFinal:f.elecFinal },
+    inputs: { unpaid:f.unpaid, unpaidNote:f.unpaidNote||'', rent:f.rent, rentNote:f.rentNote||'', cleaning:f.cleaning, cleaningNote:f.cleaningNote||'', other:f.other, otherNote:f.otherNote||'', waterFinal:f.waterFinal, elecFinal:f.elecFinal, forfeit:!!f.forfeit, termMonths:f.termMonths||'', termEnd:f.termEnd||'', manualRefund:(f.manualRefund==null?'':f.manualRefund) },
     water: calc.water, elec: calc.elec, lines: calc.lines, deductionTotal: calc.deductionTotal, refund: calc.refund
   };
   if(existing){
@@ -3272,6 +3303,7 @@ async function saveMoveOut(lease, f, existing){
     await logAudit({action:'UPDATE_MOVEOUT', entityType:'moveOut', entityId:existing.id, newValue:{roomCode:doc.roomCode, refund:doc.refund}});
     toast('บันทึกการแก้ไขสรุปคืนเงินมัดจำแล้ว','ok'); return existing.id;
   }
+  if(f.termMonths>0 && !(lease.termMonths>0)) await Store.update('leases', lease.id, {termMonths:Number(f.termMonths), termEndDate:f.termEnd});
   const id = await Store.add('moveOuts', { ...doc, status:'DRAFT', createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
     bank:null, accountMessages:[], lineSentAt:'', refundedAt:'' });
   // end the lease, free the room
@@ -3308,6 +3340,10 @@ function openMoveOutModal(lease, existing){
     '<div class="field-row"><div class="field"><label>วันที่ย้ายออก</label><input name="moveOutDate" type="date" required value="'+date0+'" '+(existing?'':'max="'+today+'"')+'></div>'+
     '<div class="field"><label>เงินมัดจำที่รับไว้ (บาท)</label><input name="deposit" type="number" min="0" step="0.01" required value="'+(existing?existing.deposit:leaseDeposit(lease))+'">'+
     '<p class="hint">'+(lease.deposit!=null&&lease.deposit!==''?'ตามสัญญา':'ยังไม่ได้ระบุในสัญญา — ใช้ค่าเริ่มต้น = ค่าเช่า 1 เดือน (แก้ได้)')+'</p></div></div>'+
+    '<h4 style="margin:12px 0 4px;">อายุสัญญา</h4>'+
+    '<div class="field-row"><div class="field"><label>ระยะเวลาสัญญา (เดือน)</label><input name="termMonths" type="number" min="1" max="120" step="1" value="'+v('termMonths', lease.termMonths||'')+'" placeholder="ไม่ระบุ"><p class="hint" id="moTermHint"></p></div>'+
+    '<div class="field"><label>&nbsp;</label><label style="display:flex;gap:8px;align-items:flex-start;font-weight:600;"><input type="checkbox" name="forfeit" style="width:auto;margin-top:3px;" '+(existing? (existing.inputs&&existing.inputs.forfeit?'checked':'') : '')+'> <span>ไม่คืนเงินมัดจำ (ย้ายออกก่อนครบสัญญา)</span></label><p class="hint">ติ๊กอัตโนมัติเมื่อวันย้ายออกก่อนวันครบสัญญา — ปลดติ๊กได้ถ้าเจ้าของอนุโลม ถ้ามียอดที่ต้องหัก ระบบหักจากมัดจำก่อน ส่วนที่เหลือเป็นเงินที่ไม่คืน</p></div></div>'+
+    '<div id="moManualBox" class="field" style="display:none;"><label>จำนวนเงินที่จะคืนลูกค้า (บาท) — ผู้ดูแลกรอกเอง</label><input name="manualRefund" type="number" min="0" step="0.01" value="'+(existing&&existing.inputs&&existing.inputs.manualRefund!==''&&existing.inputs.manualRefund!=null?existing.inputs.manualRefund:'')+'" placeholder="0 = ไม่คืน"><p class="hint" id="moManualHint"></p></div>'+
     '<h4 style="margin:12px 0 4px;">มิเตอร์วันย้ายออก</h4>'+
     '<div class="field-row">'+
       (wSep?'<div class="field"><label>มิเตอร์น้ำ ที่ถ่าย (ค่าที่คิดเงินแล้ว '+(wb?wb.value:'-')+')</label><input name="waterFinal" type="number" step="0.01" min="0" required value="'+v('waterFinal','')+'"><p class="hint" id="moWaterHint"></p></div>':'<div class="field"><label>น้ำประปา</label><input disabled value="รวมค่าเช่า/เหมาจ่าย — ไม่ต้องถ่ายมิเตอร์"></div>')+
@@ -3325,7 +3361,8 @@ function openMoveOutModal(lease, existing){
   const num = (fd,k)=> Number(fd.get(k)||0);
   function readForm(fd){
     return { roomId:lease.roomId, moveOutDate:fd.get('moveOutDate'), deposit:num(fd,'deposit'), waterFinal:fd.get('waterFinal')===null?'':fd.get('waterFinal'), elecFinal:fd.get('elecFinal')===null?'':fd.get('elecFinal'),
-      unpaid:num(fd,'unpaid'), unpaidNote:'', rent:num(fd,'rent'), rentNote:rentNoteOf(fd.get('moveOutDate')), cleaning:num(fd,'cleaning'), cleaningNote:(fd.get('cleaningNote')||'').trim(), other:num(fd,'other'), otherNote:(fd.get('otherNote')||'').trim() };
+      unpaid:num(fd,'unpaid'), unpaidNote:'', rent:num(fd,'rent'), rentNote:rentNoteOf(fd.get('moveOutDate')), cleaning:num(fd,'cleaning'), cleaningNote:(fd.get('cleaningNote')||'').trim(), other:num(fd,'other'), otherNote:(fd.get('otherNote')||'').trim(), forfeit:!!fd.get('forfeit'), termMonths:Number(fd.get('termMonths')||0)||'', termEnd:((leaseTermInfo(lease.startDate, fd.get('termMonths'), fd.get('moveOutDate'))||{}).end||''),
+      manualRefund: (Number(fd.get('termMonths')||0)>0 || fd.get('manualRefund')===null || fd.get('manualRefund')==='') ? null : Number(fd.get('manualRefund')) };
   }
   function rentNoteOf(date){ const d = moveOutDefaults(lease, date||date0).rentInfo; return d.days? d.days+' วัน ('+fmtThaiDate(d.from)+' – '+fmtThaiDate(date)+')' : ''; }
   const form = $('#modalForm', back);
@@ -3334,13 +3371,22 @@ function openMoveOutModal(lease, existing){
     const d = moveOutDefaults(lease, date).rentInfo;
     if(touchRent){ const el = form.elements['rent']; el.value = d.amount; }
     $('#moRentHint', back).textContent = d.days ? 'คิดจาก '+fmtThaiDate(d.from)+' ถึง '+fmtThaiDate(date)+' ('+d.days+' วัน) · ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough) : 'ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough)+' — ไม่มีค่าเช่าเพิ่ม (ถ้าจ่ายล่วงหน้าเกินวันย้ายออก ใส่ค่าติดลบที่ "รายการอื่นๆ")';
+    const ti = leaseTermInfo(lease.startDate, fd.get('termMonths'), date); const te = ti ? ti.end : '';
+    const manual = !ti;   // no contract term known -> the admin types the refund
+    $('#moManualBox', back).style.display = manual ? '' : 'none'; form.elements['manualRefund'].required = manual;
+    form.elements['forfeit'].disabled = manual; if(manual) form.elements['forfeit'].checked = false;
+    if(autoForfeit && !manual) form.elements['forfeit'].checked = !!(te && date < te);
+    $('#moTermHint', back).textContent = ti ? 'เริ่ม '+fmtThaiDate(lease.startDate)+' · ครบสัญญา '+fmtThaiDate(te)+(ti.renewals? ' (ต่ออัตโนมัติแล้ว '+ti.renewals+' ครั้ง)':'')+(date<te?' — ย้ายออกก่อนครบสัญญา':' — ครบสัญญาแล้ว') : 'ไม่ได้ระบุอายุสัญญา — ให้ ADMIN กรอกจำนวนเงินที่จะคืนเอง (หรือกรอกจำนวนเดือนของสัญญาให้ระบบคำนวณ)';
     const f = readForm(fd); const c = calcMoveOutLines(f);
+    if(manual) $('#moManualHint', back).textContent = 'ระบบคำนวณตามรายการหักได้ '+money(calcMoveOutLines({...f, manualRefund:null}).refund)+' บาท (อ้างอิง) · ยอดที่กรอกจะใช้แทน และระบบเติมบรรทัดปรับยอดให้ผลรวมตรงกัน';
     if($('#moWaterHint',back)) $('#moWaterHint',back).textContent = c.water && c.water.final!=null ? 'ใช้ '+c.water.units+' หน่วย = '+money(c.water.amount)+' บาท' : '';
     if($('#moElecHint',back)) $('#moElecHint',back).textContent = c.elec && c.elec.final!=null ? 'ใช้ '+c.elec.units+' หน่วย = '+money(c.elec.amount)+' บาท' : '';
     $('#moSummary', back).innerHTML = '<b>สรุป</b><br>เงินมัดจำ '+money(f.deposit)+' − รวมหัก '+money(c.deductionTotal)+' = '+
       (c.refund>=0 ? '<b style="font-size:16px;">คืนลูกค้า '+money(c.refund)+' บาท</b>' : '<b style="font-size:16px;color:var(--danger);">ลูกค้าต้องชำระเพิ่ม '+money(-c.refund)+' บาท</b>')+
       (c.lines.length? '<div style="font-size:12.5px;margin-top:6px;">'+c.lines.map(l=>escapeHtml(l.label)+': '+money(l.amount)).join('<br>')+'</div>':'');
   }
+  let autoForfeit = !existing;  // until the user touches the tick box, follow the dates
+  form.elements['forfeit'].addEventListener('click', ()=>{ autoForfeit = false; });
   form.addEventListener('input', e=>refresh(false));
   form.elements['moveOutDate'].addEventListener('change', ()=>refresh(!existing));
   refresh(false);
