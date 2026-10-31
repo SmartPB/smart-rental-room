@@ -2711,7 +2711,7 @@ async function initAutoSettings(card){
       '<h4 style="margin:14px 0 4px;">1. ออกใบแจ้งหนี้ (ส่งเข้ากลุ่มห้องด้วยมือหลังตรวจสอบเท่านั้น)</h4>'+
       chk('autoBilling', a.autoBilling, 'ออกใบแจ้งหนี้ให้ทุกห้องอัตโนมัติ เมื่อจดมิเตอร์น้ำ-ไฟครบทุกห้อง (ถ้าไม่ครบ แจ้งพนักงานเวลา 10:00 และ 17:00 และตั้งแต่วันที่ 3 จะออกบิลเฉพาะห้องที่จดแล้ว) — <b>ระบบไม่ส่งบิลเข้ากลุ่มเอง</b> ADMIN/OWNER ตรวจแล้วกดส่งที่หน้า "ใบแจ้งหนี้" (ทีละห้อง หรือทั้งหอพัก)')+
       '<div class="field"><label>เริ่มทำงานตั้งแต่เวลา (ชั่วโมง 0–23 เวลาไทย)</label><input name="billingHour" type="number" min="0" max="23" value="'+a.billingHour+'"></div>'+
-      '<div class="field"><label>ข้อมูลการชำระเงินที่แนบท้ายบิล (เลขบัญชี/พร้อมเพย์)</label><textarea name="payInfo" rows="3" maxlength="600" placeholder="เช่น ธ.กสิกรไทย 123-4-56789-0 ชื่อบัญชี …">'+escapeHtml(a.payInfo||'')+'</textarea></div>'+
+      '<div class="field"><label>ข้อมูลการชำระเงินที่แนบท้ายบิล — ค่าเริ่มต้น (ใช้กับทุกหอพักที่ไม่ได้ระบุบัญชีเฉพาะด้านล่าง)</label><textarea name="payInfo" rows="3" maxlength="600" placeholder="เช่น ธ.กสิกรไทย 123-4-56789-0 ชื่อบัญชี …">'+escapeHtml(a.payInfo||'')+'</textarea></div>'+activeProperties().map(pr=>'<div class="field"><label>บัญชีรับโอนเฉพาะหอพัก '+escapeHtml(pr.name)+' ('+escapeHtml(pr.code)+') — เว้นว่าง = ใช้ค่าเริ่มต้น</label><textarea name="payInfoProp_'+pr.id+'" rows="3" maxlength="600">'+escapeHtml((a.payInfoByProp||{})[pr.id]||'')+'</textarea></div>').join('')+''+
       '<h4 style="margin:14px 0 4px;">2. ทวงถามยอดค้าง (วันที่ 5, วันที่ 8 แล้วซ้ำจนกว่าจะชำระครบ)</h4>'+
       chk('reminders', a.reminders, 'ส่งข้อความทวงถามเข้ากลุ่มห้องที่ยังไม่ชำระ/ชำระไม่ครบ (เฉพาะใบแจ้งหนี้ที่ส่งเข้ากลุ่มแล้ว)')+
       '<div class="field"><label>หลังวันที่ 8 ทวงซ้ำทุกกี่วัน (0 = ไม่ทวงซ้ำ)</label><input name="repeatEvery" type="number" min="0" max="30" value="'+a.repeatEvery+'"></div>'+
@@ -2746,7 +2746,7 @@ async function initAutoSettings(card){
     const g = n=>fd.get(n)!==null;
     const auto = { enabled:g('enabled'), startPeriod:(fd.get('startPeriod')||'').trim(), autoBilling:g('autoBilling'), sendToRooms:false,
       reminders:g('reminders'), slipCheck:g('slipCheck'), repeatEvery:fd.get('repeatEvery'), billingHour:fd.get('billingHour'), remindHour:fd.get('remindHour'),
-      maxSlipAgeDays:fd.get('maxSlipAgeDays'), payInfo:fd.get('payInfo')||'',
+      maxSlipAgeDays:fd.get('maxSlipAgeDays'), payInfo:fd.get('payInfo')||'', payInfoByProp:Object.fromEntries(activeProperties().map(pr=>[pr.id,(fd.get('payInfoProp_'+pr.id)||'').trim()])),
       slip:{ apiKey:fd.get('slipKey')||'', matchAccount:g('matchAccount'), receiverContains:fd.get('receiverContains')||'' } };
     if(auto.enabled && !a.enabled && !confirm('เปิดระบบอัตโนมัติ? ตั้งแต่วันที่ 1 ของงวดที่เริ่ม ระบบจะออกใบแจ้งหนี้เอง (ไม่ส่งเข้ากลุ่มจนกว่า ADMIN/OWNER จะกดส่ง) และจะทวงถามเฉพาะบิลที่ส่งแล้วเองโดยไม่ถามซ้ำ')) return;
     try{
