@@ -844,14 +844,22 @@ function leaseDurationLabel(lease){
   const y = Math.floor(months/12), m = months%12;
   return (y>0? y+' ปี ':'')+m+' เดือน';
 }
-async function generateInvoice({roomId, roomCode, period, discount, discountReason}){
-  if(cache.invoices.some(i=>i.roomId===roomId && i.period===period && i.status!=='cancelled')){
-    throw new Error('ห้อง '+roomCode+' มีใบแจ้งหนี้งวด '+periodLabel(period)+' อยู่แล้ว');
+function periodAdd(p, n){ let q=p; for(let i=0;i<n;i++) q=nextPeriod(q); return q; }
+/* an earlier multi-month (prepaid) invoice that already covers the rent of `period` for this room */
+function prepayCoverFor(roomId, period){
+  return cache.invoices.find(i=>i.roomId===roomId && i.prepayMonths>1 && i.status!=='cancelled' && i.status!=='waived' && i.period<period && period<=i.prepayTo) || null;
+}
+async function generateInvoice({roomId, roomCode, period, discount, discountReason, prepayMonths}){
+  const n = Math.min(12, Math.max(1, Math.floor(Number(prepayMonths||1))));
+  for(let k=0;k<n;k++){ const pk = periodAdd(period,k);
+    if(cache.invoices.some(i=>i.roomId===roomId && i.period===pk && i.status!=='cancelled')) throw new Error('ห้อง '+roomCode+' มีใบแจ้งหนี้งวด '+periodLabel(pk)+' อยู่แล้ว'+(k?' (อยู่ในช่วงที่จะชำระล่วงหน้า)':''));
   }
+  const cover = prepayCoverFor(roomId, period);
+  if(cover && n>1) throw new Error('ห้อง '+roomCode+' ชำระค่าเช่างวด '+periodLabel(period)+' ล่วงหน้าไว้แล้ว (ใบ '+(cover.invoiceNumber||'-')+' ถึง '+periodLabel(cover.prepayTo)+')');
   const room = roomById(roomId);
   const prop = propertyById(room.propertyId);
   const lease = activeLeaseFor(roomId);
-  const rent = lease? lease.rent : room.rent;
+  const rent1 = lease? lease.rent : room.rent;
   const readPeriod = prevPeriod(period);   // meters read at the end of the previous month are billed with this month's rent
   const water = readingFor(roomId,'water',readPeriod);
   const elec = readingFor(roomId,'elec',readPeriod);
@@ -864,9 +872,13 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   if(waterMode==='SEPARATE') waterAmount = water ? Math.round(water.usage*cfg.waterRate) : 0;
   else if(waterMode==='FLAT') waterAmount = roomWaterFlatFee(room);
   const elecAmount = (elecMode==='SEPARATE' && elec) ? Math.round(elec.usage*cfg.elecRate) : 0;
-  const commonFee = Number(room.commonFee||0);
+  // prepaid months: rent + common fee x N on one bill; water/electric are only for the first month (later months bill utilities only)
+  const prepaid = !!cover;
+  const rent = prepaid ? 0 : rent1*n;
+  const commonFee = prepaid ? 0 : Number(room.commonFee||0)*n;
   discount = Number(discount||0);
   const total = Math.max(0, rent + waterAmount + elecAmount + commonFee - discount);
+  if(prepaid && total<=0) throw new Error('ห้อง '+roomCode+' ชำระค่าเช่างวด '+periodLabel(period)+' ล่วงหน้าแล้ว (ใบ '+(cover.invoiceNumber||'-')+') และไม่มีค่าน้ำ-ไฟที่ต้องเรียกเก็บ');
 
   let discountState = 'none';
   const r = Session.user.role;
@@ -879,6 +891,7 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   const invId = await Store.add('invoices', {
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: room.propertyId, propertyCode: prop.code,
     roomId, roomCode, period, readingPeriod: readPeriod, waterMode, elecMode, rentAmount:rent,
+    prepayMonths: n>1? n : 0, prepayTo: n>1? periodAdd(period,n-1) : '', prepaidBy: prepaid? cover.id : '', prepaidByNumber: prepaid? (cover.invoiceNumber||'') : '',
     waterUnits: water?water.usage:0, waterAmount, elecUnits: elec?elec.usage:0, elecAmount, commonFee,
     discount, discountReason: discountReason||'', discountState, discountApprovedBy: discountState==='approved'? Session.user.name : '',
     total, status: discountState==='pending' ? 'pending_discount' : 'unpaid',
@@ -895,8 +908,8 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
       requiredRole: approverRole, status:'PENDING', requestedAt: nowIso()
     });
   }
-  await logAudit({action:'CREATE_INVOICE', entityType:'invoice', entityId:invId, newValue:{roomCode,period,total,discount,invoiceNumber:invSeq.label}});
-  toast('ออกใบแจ้งหนี้ '+invSeq.label+' ห้อง '+roomCode+' งวด '+periodLabel(period)+' แล้ว','ok');
+  await logAudit({action:'CREATE_INVOICE', entityType:'invoice', entityId:invId, newValue:{roomCode,period,total,discount,invoiceNumber:invSeq.label,prepayMonths:n>1?n:0}});
+  toast('ออกใบแจ้งหนี้ '+invSeq.label+' ห้อง '+roomCode+' งวด '+periodLabel(period)+(n>1?' ล่วงหน้า '+n+' เดือน (ถึง '+periodLabel(periodAdd(period,n-1))+')':'')+' แล้ว','ok');
 }
 async function requestInvoiceCancel(invoice, reason){
   if(!reason||!reason.trim()) throw new Error('ต้องระบุเหตุผลในการขอยกเลิกใบแจ้งหนี้');
@@ -927,6 +940,7 @@ async function reissueInvoice(oldInvoice){
   const newId = await Store.add('invoices', {
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: oldInvoice.propertyId, propertyCode: prop.code,
     roomId: oldInvoice.roomId, roomCode: oldInvoice.roomCode, period: oldInvoice.period, waterMode: oldInvoice.waterMode, elecMode: oldInvoice.elecMode,
+    prepayMonths: oldInvoice.prepayMonths||0, prepayTo: oldInvoice.prepayTo||'', prepaidBy: oldInvoice.prepaidBy||'', prepaidByNumber: oldInvoice.prepaidByNumber||'',
     rentAmount: oldInvoice.rentAmount, waterUnits: oldInvoice.waterUnits, waterAmount: oldInvoice.waterAmount,
     elecUnits: oldInvoice.elecUnits, elecAmount: oldInvoice.elecAmount, commonFee: oldInvoice.commonFee,
     discount:0, discountReason:'', discountState:'none', discountApprovedBy:'',
@@ -2401,7 +2415,7 @@ function renderInvoices(root){
     const waterFlat = i.waterMode==='FLAT';
     return '<tr><td class="mono">'+(i.invoiceNumber||'-')+(i.replacesInvoiceId?'<div class="footnote">แทนใบเดิม</div>':'')+(i.moveOutId?'<div class="footnote">หักจากเงินมัดจำ (ย้ายออก)</div>':'')+
       (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
-      '<td class="num">'+money(i.rentAmount)+'</td>'+
+      '<td class="num">'+money(i.rentAmount)+(i.prepayMonths>1?'<div class="footnote">ล่วงหน้า '+i.prepayMonths+' เดือน ถึง '+periodLabel(i.prepayTo)+'</div>':'')+(i.prepaidBy?'<div class="footnote">ชำระล่วงหน้าแล้ว'+(i.prepaidByNumber?' ('+escapeHtml(i.prepaidByNumber)+')':'')+'</div>':'')+'</td>'+
       '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':'')))+'</td>'+
       '<td class="num">'+(elecInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':money(i.elecAmount))+'</td>'+
       '<td class="num">'+money(i.commonFee||0)+'</td>'+
@@ -2545,7 +2559,7 @@ function lineChunks(text, max){
 const lm = n=>{ n=Number(n||0); return Number.isInteger(n) ? n.toLocaleString('en-US') : n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
 function invoiceBreakdown(i){
   const wMode = i.waterMode||i.billingMode, eMode = i.elecMode||i.billingMode;
-  const parts = ['เช่า '+lm(i.rentAmount)];
+  const parts = [i.prepaidBy ? 'ค่าเช่า ชำระล่วงหน้าแล้ว' : (i.prepayMonths>1 ? 'เช่า '+i.prepayMonths+' เดือน ('+periodLabel(i.period)+' – '+periodLabel(i.prepayTo)+') '+lm(i.rentAmount) : 'เช่า '+lm(i.rentAmount))];
   if(wMode!=='INCLUSIVE') parts.push('น้ำ '+lm(i.waterAmount)+(i.waterMode==='FLAT'?' (เหมา)':(i.waterUnits? ' ('+i.waterUnits+' หน่วย)':'')));
   if(eMode!=='INCLUSIVE') parts.push('ไฟ '+lm(i.elecAmount)+(i.elecUnits? ' ('+i.elecUnits+' หน่วย)':''));
   if(Number(i.commonFee||0)>0) parts.push('ส่วนกลาง '+lm(i.commonFee));
@@ -2555,7 +2569,7 @@ function invoiceBreakdown(i){
 function buildBillText(invs, period, detail){
   if(invs.length===1){
     const i = invs[0]; const rm = roomById(i.roomId); const p = rm? propertyById(rm.propertyId):null;
-    const lines = ['ใบแจ้งหนี้ '+(i.invoiceNumber||'-'), 'ห้อง '+i.roomCode+(p?' · '+p.name:'')+' · งวด '+periodLabel(i.period)];
+    const lines = ['ใบแจ้งหนี้ '+(i.invoiceNumber||'-'), 'ห้อง '+i.roomCode+(p?' · '+p.name:'')+' · งวด '+periodLabel(i.period)+(i.prepayMonths>1?' (ชำระล่วงหน้า '+i.prepayMonths+' เดือน)':'')];
     invoiceBreakdown(i).forEach(x=>lines.push('- '+x));
     lines.push('รวมทั้งสิ้น '+lm(i.total)+' บาท');
     if(i.status==='pending_discount') lines.push('(รออนุมัติส่วนลด)');
@@ -2801,12 +2815,14 @@ function openInvoiceModal(){
   const periods = pastPeriods(nextPeriod(billPeriodNow()),4);
   openModal({title:'ออกใบแจ้งหนี้', onSubmit: async fd=>{
     const roomId = fd.get('roomId'); const room = roomById(roomId);
-    await generateInvoice({roomId, roomCode:room.code, period:fd.get('period'), discount:fd.get('discount'), discountReason:fd.get('discountReason')});
+    await generateInvoice({roomId, roomCode:room.code, period:fd.get('period'), discount:fd.get('discount'), discountReason:fd.get('discountReason'), prepayMonths:fd.get('prepayMonths')});
   }, bodyHtml:
     '<div class="field"><label>ห้อง</label><select name="roomId" required>'+eligible.map(r=>'<option value="'+r.id+'">'+r.code+' — '+activeLeaseFor(r.id).tenantName+' (น้ำ:'+WATER_MODE_LABEL[roomWaterMode(r)]+' / ไฟ:'+ELEC_MODE_LABEL[roomElecMode(r)]+')</option>').join('')+'</select></div>'+
     '<div class="field"><label>งวดบิล</label><select name="period" required>'+periods.slice().reverse().map(p=>'<option value="'+p+'" '+(p===billPeriodNow()?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select>'+
     '<p class="hint">ใบแจ้งหนี้เป็นค่าเช่าของเดือนที่เลือก ส่วนค่าน้ำ-ไฟคิดจากมิเตอร์ที่จดปลายเดือนก่อนหน้า (เช่น ค่าเช่า พ.ย. ใช้มิเตอร์ที่จด ต.ค.) · ระบบจะดึงค่าเช่าและค่าส่วนกลางจากห้อง และคำนวณค่าน้ำ-ไฟจากมิเตอร์โดยอัตโนมัติ (ห้ามคิดค่าน้ำ-ไฟแยกถ้าห้องตั้งเป็น “รวมในค่าเช่า”)</p></div>'+
     '<div class="field-row"><div class="field"><label>ส่วนลด (บาท, ถ้ามี)</label><input name="discount" type="number" min="0" value="0"></div>'+
+    '<div class="field"><label>ชำระค่าเช่าล่วงหน้า (เดือน)</label><select name="prepayMonths">'+[1,2,3,4,5,6,7,8,9,10,11,12].map(n=>'<option value="'+n+'">'+(n===1?'1 เดือน (ปกติ)':n+' เดือน'+(n===6||n===12?' ('+(n===6?'ครึ่งปี':'1 ปี')+')':''))+'</option>').join('')+'</select>'+
+      '<p class="hint">ลูกค้าที่จ่ายล่วงหน้า: ค่าเช่าและค่าส่วนกลางคูณจำนวนเดือน รวมในใบเดียว ค่าน้ำ-ไฟคิดเฉพาะเดือนแรก เดือนถัดไประบบออกบิลเฉพาะค่าน้ำ-ไฟเมื่อจดมิเตอร์ (ค่าเช่าแสดงว่าชำระแล้ว) · ส่วนลดใส่ในช่องด้านล่าง</p></div>'+
     '<div class="field"><label>เหตุผลส่วนลด</label><input name="discountReason" placeholder="ไม่บังคับถ้าไม่มีส่วนลด"></div></div>'+
     '<div class="help-box">ส่วนลดเกิน '+(cache.config.discountApprovalThreshold||100)+' บาท ต้องผ่านการอนุมัติจากเจ้าของกิจการ ส่วนลดของพนักงานทุกจำนวนต้องผ่านผู้ดูแลระบบขึ้นไปก่อนเสมอ</div>'});
 }
@@ -3239,13 +3255,14 @@ function moveOutDefaults(lease, moveOutDate){
   const room = roomById(lease.roomId); const rent = Number(lease.rent||room.rent||0);
   const invs = cache.invoices.filter(i=>i.roomId===lease.roomId && i.status!=='cancelled').sort((a,b)=>a.period<b.period?1:-1);
   let coveredThrough;
-  if(invs.length){ const p = invs[0].period; coveredThrough = ymdLocal(new Date(+p.slice(0,4), +p.slice(4,6), 0)); }
+  if(invs.length){ const p = invs.reduce((m,i)=>{ const q = (i.prepayMonths>1 && i.prepayTo) ? i.prepayTo : i.period; return q>m?q:m; }, ''); coveredThrough = ymdLocal(new Date(+p.slice(0,4), +p.slice(4,6), 0)); }
   else { const d = new Date(moveOutDate+'T00:00:00'); coveredThrough = ymdLocal(new Date(d.getFullYear(), d.getMonth(), 0)); }
   let rentInfo = { amount:0, days:0, coveredThrough };
   if(moveOutDate > coveredThrough){
     const from = ymdLocal(new Date(new Date(coveredThrough+'T00:00:00').getTime()+86400000));
     const rb = rentBetween(rent, from, moveOutDate); rentInfo = { ...rb, from, coveredThrough };
   }
+  if(moveOutDate < coveredThrough){ const from = ymdLocal(new Date(new Date(moveOutDate+'T00:00:00').getTime()+86400000)); rentInfo.unused = rentBetween(rent, from, coveredThrough); }
   return { rent, rentInfo };
 }
 function calcMoveOutLines(f){
@@ -3370,7 +3387,8 @@ function openMoveOutModal(lease, existing){
     const fd = new FormData(form); const date = fd.get('moveOutDate')||date0;
     const d = moveOutDefaults(lease, date).rentInfo;
     if(touchRent){ const el = form.elements['rent']; el.value = d.amount; }
-    $('#moRentHint', back).textContent = d.days ? 'คิดจาก '+fmtThaiDate(d.from)+' ถึง '+fmtThaiDate(date)+' ('+d.days+' วัน) · ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough) : 'ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough)+' — ไม่มีค่าเช่าเพิ่ม (ถ้าจ่ายล่วงหน้าเกินวันย้ายออก ใส่ค่าติดลบที่ "รายการอื่นๆ")';
+    const unusedTxt = d.unused && d.unused.days ? ' · ชำระค่าเช่าล่วงหน้าเกินวันย้ายออก '+d.unused.days+' วัน (ประมาณ '+money(d.unused.amount)+' บาท) — ถ้าจะคืน ให้ใส่ค่าติดลบที่ "รายการอื่นๆ"' : '';
+    $('#moRentHint', back).textContent = (d.days ? 'คิดจาก '+fmtThaiDate(d.from)+' ถึง '+fmtThaiDate(date)+' ('+d.days+' วัน) · ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough) : 'ใบแจ้งหนี้เก็บค่าเช่าไปแล้วถึง '+fmtThaiDate(d.coveredThrough)+' — ไม่มีค่าเช่าเพิ่ม (ถ้าจ่ายล่วงหน้าเกินวันย้ายออก ใส่ค่าติดลบที่ "รายการอื่นๆ")') + unusedTxt;
     const ti = leaseTermInfo(lease.startDate, fd.get('termMonths'), date); const te = ti ? ti.end : '';
     const manual = !ti;   // no contract term known -> the admin types the refund
     $('#moManualBox', back).style.display = manual ? '' : 'none'; form.elements['manualRefund'].required = manual;
