@@ -2368,34 +2368,60 @@ function openMeterModal(room, type, existing){
    VIEW: INVOICES
    ============================================================ */
 const INVOICE_STATUS_LABEL = {unpaid:'ยังไม่ชำระ', partial:'ชำระบางส่วน', paid:'ชำระครบแล้ว', pending_discount:'รออนุมัติส่วนลด', cancelled:'ยกเลิกแล้ว', waived:'ยกหนี้แล้ว'};
+const InvUi = { period:'', page:1 };
 function renderInvoices(root){
   const scopedRoomIds = new Set(scopedRooms().map(r=>r.id));
   const roomMeta = id=>{ const rm=roomById(id); const p = rm? propertyById(rm.propertyId):null; return {propCode: p?p.code:'', roomCode: rm?rm.code:''}; };
-  const rows = cache.invoices.filter(i=>scopedRoomIds.has(i.roomId)).slice().sort((a,b)=>{
-    const ma=roomMeta(a.roomId), mb=roomMeta(b.roomId);
-    if(ma.propCode!==mb.propCode) return ma.propCode<mb.propCode?-1:1;
-    if(ma.roomCode!==mb.roomCode) return ma.roomCode<mb.roomCode?-1:1;
-    return (b.period||'')<(a.period||'')?-1:1;
+  // newest created on top; one month (rent period) at a time, 20 per page
+  const allRows = cache.invoices.filter(i=>scopedRoomIds.has(i.roomId)).slice().sort((a,b)=>{
+    const ca=a.createdAt||'', cb=b.createdAt||'';
+    if(ca!==cb) return ca<cb?1:-1;
+    return (b.invoiceSeq||0)-(a.invoiceSeq||0);
   });
+  const monthCount = {}; allRows.forEach(i=>{ monthCount[i.period] = (monthCount[i.period]||0)+1; });
+  const monthList = [...new Set([...Object.keys(monthCount), billPeriodNow(), nextPeriod(billPeriodNow())])].filter(Boolean).sort().reverse();
+  if(!InvUi.period || !monthList.includes(InvUi.period)){ InvUi.period = monthCount[billPeriodNow()] ? billPeriodNow() : (Object.keys(monthCount).sort().reverse()[0] || billPeriodNow()); InvUi.page = 1; }
+  const monthRows = allRows.filter(i=>i.period===InvUi.period);
+  const PAGE = 20, pages = Math.max(1, Math.ceil(monthRows.length/PAGE));
+  if(InvUi.page>pages) InvUi.page = pages; if(InvUi.page<1) InvUi.page = 1;
+  const rows = monthRows.slice((InvUi.page-1)*PAGE, InvUi.page*PAGE);
+  const live = monthRows.filter(i=>!['cancelled','waived'].includes(i.status));
+  const liveTotal = live.reduce((t,i)=>t+Number(i.total||0),0);
+  const mIdx = monthList.indexOf(InvUi.period);
   const gaps = computeInvoiceGaps().filter(g=> selectedPropertyId==='ALL' || g.propertyId===selectedPropertyId);
   const period = billPeriodNow();
   const genEligible = scopedRooms().filter(r=>r.status==='OCCUPIED' && activeLeaseFor(r.id) &&
     !cache.invoices.some(i=>i.roomId===r.id && i.period===period && i.status!=='cancelled'));
   root.innerHTML =
-    '<div class="section-title"><div><h2>ใบแจ้งหนี้</h2><div class="desc">เลขที่ใบแจ้งหนี้รันต่อเนื่องโดยระบบ ห้ามลบ — ผิดพลาดต้องยกเลิกแล้วออกใบใหม่แทน · เรียงตามรหัสหอพัก แล้วเลขห้อง</div></div>'+
+    '<div class="section-title"><div><h2>ใบแจ้งหนี้</h2><div class="desc">เลขที่ใบแจ้งหนี้รันต่อเนื่องโดยระบบ ห้ามลบ — ผิดพลาดต้องยกเลิกแล้วออกใบใหม่แทน · แสดงทีละเดือน (เลือกย้อนหลังได้) หน้าละ 20 ใบ เรียงใบที่ออกล่าสุดไว้บนสุด</div></div>'+
       '<div class="tag-row">'+
       (can('CREATE_INVOICE') && genEligible.length? '<button class="btn primary" id="bulkGenBtn">'+icon('invoice')+' ออกใบแจ้งหนี้ทุกห้อง งวด '+periodLabel(period)+' ('+genEligible.length+' ห้อง)</button>':'')+
       (can('CREATE_INVOICE')? '<button class="btn" id="newInvBtn">'+icon('plus')+' ออกใบแจ้งหนี้รายห้อง</button>':'')+
-      (can('SEND_BILLS') && rows.some(i=>i.status==='unpaid') ? '<button class="btn primary" id="sendBillsBtn">'+icon('send')+' ตรวจสอบและส่งบิลเข้ากลุ่มห้อง</button>':'')+
-      (rows.some(i=>i.status!=='cancelled') ? '<button class="btn" id="lineBtn">'+icon('send')+' แจ้งสรุปเข้ากลุ่มพนักงาน</button>':'')+
+      (can('SEND_BILLS') && allRows.some(i=>i.status==='unpaid') ? '<button class="btn primary" id="sendBillsBtn">'+icon('send')+' ตรวจสอบและส่งบิลเข้ากลุ่มห้อง</button>':'')+
+      (allRows.some(i=>i.status!=='cancelled') ? '<button class="btn" id="lineBtn">'+icon('send')+' แจ้งสรุปเข้ากลุ่มพนักงาน</button>':'')+
       '</div></div>'+
     (gaps.length? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);color:var(--danger);">'+
       icon('bell')+' พบเลขที่ใบแจ้งหนี้ขาดหาย '+gaps.length+' เลข: '+gaps.map(g=>g.label).join(', ')+'</div>' : '')+
+    '<div class="card" style="margin-bottom:10px;"><div class="tag-row" style="align-items:center;gap:8px;padding:10px 14px;flex-wrap:wrap;">'+
+      '<button class="btn sm" id="invPrevM" '+(mIdx>=monthList.length-1?'disabled':'')+' title="เดือนก่อนหน้า">‹ เดือนก่อน</button>'+
+      '<select id="invMonthSel" class="btn" style="min-width:200px;font-weight:700;">'+monthList.map(m=>'<option value="'+m+'" '+(m===InvUi.period?'selected':'')+'>'+periodLabel(m)+' ('+(monthCount[m]||0)+' ใบ)</option>').join('')+'</select>'+
+      '<button class="btn sm" id="invNextM" '+(mIdx<=0?'disabled':'')+' title="เดือนถัดไป">เดือนถัดไป ›</button>'+
+      '<span class="footnote" style="margin-left:auto;">ค่าเช่าเดือน '+periodLabel(InvUi.period)+' · '+live.length+' ใบ (ไม่รวมที่ยกเลิก) รวม '+money(liveTotal)+' บาท</span></div></div>'+
     '<div class="card"><div class="tbl-wrap"><table class="grid"><thead><tr>'+
       '<th>เลขที่ใบแจ้งหนี้</th><th>ห้อง</th><th>งวด</th><th>ค่าเช่า</th><th>ค่าน้ำ</th><th>ค่าไฟ</th><th>ส่วนกลาง</th><th>ส่วนลด</th><th>รวม</th><th>สถานะ</th><th></th>'+
-    '</tr></thead><tbody id="invBody"></tbody></table></div></div>';
+    '</tr></thead><tbody id="invBody"></tbody></table></div></div>'+
+    '<div class="tag-row" style="justify-content:center;align-items:center;gap:10px;margin:12px 0;">'+
+      '<button class="btn sm" id="invPrevP" '+(InvUi.page<=1?'disabled':'')+'>‹ ก่อนหน้า</button>'+
+      '<span class="footnote">'+(monthRows.length? 'แสดง '+((InvUi.page-1)*PAGE+1)+'–'+Math.min(InvUi.page*PAGE, monthRows.length)+' จาก '+monthRows.length+' ใบ · หน้า '+InvUi.page+'/'+pages : '')+'</span>'+
+      '<button class="btn sm" id="invNextP" '+(InvUi.page>=pages?'disabled':'')+'>ถัดไป ›</button></div>';
+  const goMonth = m=>{ InvUi.period = m; InvUi.page = 1; renderInvoices(root); };
+  $('#invMonthSel').addEventListener('change', e=>goMonth(e.target.value));
+  $('#invPrevM').addEventListener('click', ()=>goMonth(monthList[mIdx+1]));
+  $('#invNextM').addEventListener('click', ()=>goMonth(monthList[mIdx-1]));
+  $('#invPrevP').addEventListener('click', ()=>{ InvUi.page--; renderInvoices(root); });
+  $('#invNextP').addEventListener('click', ()=>{ InvUi.page++; renderInvoices(root); });
   const body = $('#invBody');
-  if(!rows.length){ body.innerHTML = '<tr><td colspan="11" class="empty-row">ยังไม่มีใบแจ้งหนี้</td></tr>'; }
+  if(!rows.length){ body.innerHTML = '<tr><td colspan="11" class="empty-row">ยังไม่มีใบแจ้งหนี้ของเดือน '+periodLabel(InvUi.period)+'</td></tr>'; }
   else body.innerHTML = rows.map(i=>{
     const paid = cache.payments.filter(p=>p.invoiceId===i.id && p.status==='active').reduce((s,p)=>s+p.amount,0);
     const stMap = {unpaid:'warn', partial:'warn', paid:'ok', pending_discount:'muted', cancelled:'bad', waived:'muted'};
@@ -2960,7 +2986,7 @@ function renderPayments(root){
     '<div class="section-title"><div><h2>การรับชำระเงิน &amp; ใบเสร็จ</h2><div class="desc">ออกใบเสร็จได้ต่อเมื่อแนบหลักฐานการชำระเงินแล้วเท่านั้น เลขที่รันต่อเนื่องโดยระบบ ห้ามลบ — ผิดพลาดต้อง VOID แล้วรับชำระใหม่แทน</div></div></div>'+
     '<div id="slipPanel"></div>'+
     '<div class="card"><div class="card-head"><div><h3>สถานะการชำระเงินรายห้อง — งวด '+periodLabel(billPeriodNow())+'</h3>'+
-      '<div class="desc">เรียงตามรหัสหอพัก แล้วเลขห้อง — เขียว: ชำระแล้ว · เหลือง: ยังไม่ถึงกำหนด (ไม่เกินวันที่ 5) · แดง: ค้างชำระเกินวันที่ 5</div></div>'+
+      '<div class="desc">แสดงทีละเดือน (เลือกย้อนหลังได้) หน้าละ 20 ใบ เรียงใบที่ออกล่าสุดไว้บนสุด — เขียว: ชำระแล้ว · เหลือง: ยังไม่ถึงกำหนด (ไม่เกินวันที่ 5) · แดง: ค้างชำระเกินวันที่ 5</div></div>'+
       '<div class="tag-row"><span class="pill ok">ชำระแล้ว '+counts.PAID+'</span><span class="pill warn">รอครบกำหนด '+counts.DUE+'</span><span class="pill bad">ค้างเกินกำหนด '+counts.OVERDUE+'</span></div>'+
     '</div><div class="room-status-grid" id="roomStatusGrid"></div></div>'+
     (gaps.length? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);color:var(--danger);">'+
