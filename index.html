@@ -2743,7 +2743,7 @@ const lm = n=>{ n=Number(n||0); return Number.isInteger(n) ? n.toLocaleString('e
 function invoiceBreakdown(i){
   const wMode = i.waterMode||i.billingMode, eMode = i.elecMode||i.billingMode;
   const parts = [i.prepaidBy ? 'ค่าเช่า ชำระล่วงหน้าแล้ว' : (i.prepayMonths>1 ? 'เช่า '+i.prepayMonths+' เดือน ('+periodLabel(i.period)+' – '+periodLabel(i.prepayTo)+') '+lm(i.rentAmount) : 'เช่า '+lm(i.rentAmount))];
-  if(wMode!=='INCLUSIVE') parts.push('น้ำ '+lm(i.waterAmount)+(i.waterMode==='FLAT'?' (เหมา)':(i.waterUnits||i.waterMinApplied? ' ('+(i.waterUnits||0)+' หน่วย'+(i.waterMinApplied?' · คิดขั้นต่ำ '+lm(i.waterMinFee)+' บาท':'')+')':'')));
+  if(wMode!=='INCLUSIVE') parts.push('น้ำ '+lm(i.waterAmount)+(i.waterMode==='FLAT'?' (เหมา)':(i.waterUnits && !(Number(i.waterMinFee)>0 && Number(i.waterAmount)<=Number(i.waterMinFee)) ? ' ('+i.waterUnits+' หน่วย)':'')));
   if(eMode!=='INCLUSIVE') parts.push('ไฟ '+lm(i.elecAmount)+(i.elecUnits? ' ('+i.elecUnits+' หน่วย)':''));
   if(Number(i.commonFee||0)>0) parts.push('ส่วนกลาง '+lm(i.commonFee));
   if(Number(i.discount||0)>0) parts.push('ส่วนลด -'+lm(i.discount));
