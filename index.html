@@ -1072,27 +1072,40 @@ async function closeRepairRequest(req, {cost, costNote}){
    One ledger, two entry types: EXPENSE (ค่าน้ำ-ไฟรวมของหอ, ค่าซ่อมบำรุง, ค่าจ้าง ฯลฯ)
    and INCOME (รายได้อื่นนอกเหนือค่าเช่า เช่น เครื่องซักผ้าหยอดเหรียญ, ค่าที่จอดรถ).
    Feeds the per-property profit/loss summary on the dashboard. */
-async function createExpense({propertyId, date, item, amount, note, repairRequestId, type}){
-  if(!item || !item.trim()) throw new Error('ต้องระบุรายการ');
+const EXPENSE_CATS = [
+  {id:'ELECTRIC',label:'ค่าไฟฟ้า'}, {id:'WATER',label:'ค่าน้ำประปา'}, {id:'GARBAGE',label:'ค่าขยะ'}, {id:'REDBOX',label:'ค่าตู้แดง'},
+  {id:'MAID',label:'ค่าแม่บ้าน'}, {id:'INTERNET',label:'ค่าอินเทอร์เน็ต'}, {id:'REPAIR',label:'ค่าซ่อมบำรุง'}, {id:'OTHER',label:'อื่นๆ'} ];
+const EXPENSE_CAT_LABEL = Object.fromEntries(EXPENSE_CATS.map(c=>[c.id,c.label]));
+/* category of an expense row; old rows without one: repair auto-entries -> ซ่อมบำรุง, everything else -> อื่นๆ */
+function expenseCat(e){ if(expenseType(e)!=='EXPENSE') return ''; if(e.category && EXPENSE_CAT_LABEL[e.category]) return e.category; return e.repairRequestId ? 'REPAIR' : 'OTHER'; }
+async function createExpense({propertyId, date, item, amount, note, repairRequestId, type, category}){
+  const finalType = type==='INCOME' ? 'INCOME' : 'EXPENSE';
+  const cat = finalType==='EXPENSE' ? (repairRequestId ? 'REPAIR' : (EXPENSE_CAT_LABEL[category] ? category : 'OTHER')) : '';
+  item = (item||'').trim();
+  if(!item && finalType==='EXPENSE' && cat!=='OTHER') item = EXPENSE_CAT_LABEL[cat];
+  if(!item) throw new Error(finalType==='INCOME' ? 'ต้องระบุรายการรับ' : 'เลือก "อื่นๆ" ต้องระบุรายละเอียดค่าใช้จ่าย');
   const amt = Number(amount);
   if(isNaN(amt) || amt<=0) throw new Error('ต้องระบุยอดเงินให้ถูกต้อง');
-  const finalType = type==='INCOME' ? 'INCOME' : 'EXPENSE';
   const prop = propertyById(propertyId);
   const id = await Store.add('expenses', {
-    propertyId: propertyId||'', propertyCode: prop? prop.code:'', date: date||todayStr(), item:item.trim(),
-    amount:amt, note:(note||'').trim(), repairRequestId: repairRequestId||'', type: finalType,
+    propertyId: propertyId||'', propertyCode: prop? prop.code:'', date: date||todayStr(), item,
+    amount:amt, note:(note||'').trim(), repairRequestId: repairRequestId||'', type: finalType, category: cat,
     createdBy: Session.user.id, createdByName: Session.user.name, createdAt: nowIso()
   });
-  await logAudit({action: finalType==='INCOME'?'CREATE_OTHER_INCOME':'CREATE_EXPENSE', entityType:'expense', entityId:id, newValue:{item, amount:amt, type:finalType}});
+  await logAudit({action: finalType==='INCOME'?'CREATE_OTHER_INCOME':'CREATE_EXPENSE', entityType:'expense', entityId:id, newValue:{item, amount:amt, type:finalType, category:cat}});
   return id;
 }
 async function updateExpense(exp, patch){
-  if(!patch.item || !patch.item.trim()) throw new Error('ต้องระบุรายการ');
+  const type = patch.type ? (patch.type==='INCOME'?'INCOME':'EXPENSE') : expenseType(exp);
+  patch.type = type;
+  patch.category = type==='EXPENSE' ? (EXPENSE_CAT_LABEL[patch.category] ? patch.category : expenseCat(exp)||'OTHER') : '';
+  patch.item = (patch.item||'').trim();
+  if(!patch.item && type==='EXPENSE' && patch.category!=='OTHER') patch.item = EXPENSE_CAT_LABEL[patch.category];
+  if(!patch.item) throw new Error(type==='INCOME' ? 'ต้องระบุรายการรับ' : 'เลือก "อื่นๆ" ต้องระบุรายละเอียดค่าใช้จ่าย');
   if(isNaN(patch.amount) || patch.amount<=0) throw new Error('ต้องระบุยอดเงินให้ถูกต้อง');
-  if(patch.type) patch.type = patch.type==='INCOME' ? 'INCOME' : 'EXPENSE';
   await Store.update('expenses', exp.id, patch);
   await logAudit({action:'UPDATE_EXPENSE', entityType:'expense', entityId:exp.id, oldValue:{item:exp.item, amount:exp.amount, type:expenseType(exp)}, newValue:patch});
-  toast((expenseType(patch.type?patch:exp)==='INCOME'?'แก้ไขรายการรายได้อื่นแล้ว':'แก้ไขรายการค่าใช้จ่ายแล้ว'),'ok');
+  toast((type==='INCOME'?'แก้ไขรายการรายได้อื่นแล้ว':'แก้ไขรายการค่าใช้จ่ายแล้ว'),'ok');
 }
 async function deleteExpense(exp){
   await Store.remove('expenses', exp.id);
@@ -1287,6 +1300,63 @@ function computeOverdueInvoices(){
     .filter(x=>x.outstanding>0.005)
     .sort((a,b)=> b.monthsOverdue-a.monthsOverdue || b.outstanding-a.outstanding);
 }
+/* ---- profit & loss (cash basis: rent/utility income = payments by the date the money was received) ---- */
+const FinUi = { mode:'month', period:'', year:'' };
+function thYear(y){ return Number(y)+543; }
+function localYmd(iso){ const d = new Date(iso); return isNaN(d) ? '' : ymdLocal(d); }
+function monthRange(period){ const y=+period.slice(0,4), m=+period.slice(4,6); return {from: period.slice(0,4)+'-'+period.slice(4,6)+'-01', to: ymdLocal(new Date(y,m,0))}; }
+function yearRange(year){ return {from:year+'-01-01', to:year+'-12-31'}; }
+function finInit(){ if(!FinUi.period){ FinUi.period = periodOfDate(todayStr()); FinUi.year = todayStr().slice(0,4); } }
+function finRange(){ finInit(); return FinUi.mode==='year' ? yearRange(FinUi.year) : monthRange(FinUi.period); }
+function finLabel(){ finInit(); return FinUi.mode==='year' ? 'ปี '+thYear(FinUi.year) : periodLabel(FinUi.period); }
+function pnlCompute(range, propertyId){
+  const inProp = id => propertyId==='ALL' || id===propertyId;
+  const pays = cache.payments.filter(p=>p.status==='active' && inProp(p.propertyId)).filter(p=>{ const d = localYmd(p.receivedAt); return d>=range.from && d<=range.to; });
+  const led = cache.expenses.filter(e=>inProp(e.propertyId) && (e.date||'')>=range.from && (e.date||'')<=range.to);
+  const byCat = {}; EXPENSE_CATS.forEach(c=>{ byCat[c.id]=0; });
+  const inc = {};
+  let expTotal = 0, otherIncome = 0, expCount = 0;
+  led.forEach(e=>{
+    const a = Number(e.amount||0);
+    if(expenseType(e)==='INCOME'){ otherIncome += a; inc[e.item] = (inc[e.item]||0)+a; }
+    else { expTotal += a; expCount++; byCat[expenseCat(e)] += a; }
+  });
+  const rentIncome = r2(pays.reduce((t,p)=>t+Number(p.amount||0),0));
+  otherIncome = r2(otherIncome); expTotal = r2(expTotal);
+  return { rentIncome, payCount: pays.length, otherIncome, otherItems:Object.entries(inc).map(([item,amount])=>({item,amount:r2(amount)})).sort((a,b)=>b.amount-a.amount),
+    expTotal, expCount, byCat, totalIncome: r2(rentIncome+otherIncome), net: r2(rentIncome+otherIncome-expTotal) };
+}
+function finYears(){
+  const ys = new Set([todayStr().slice(0,4)]);
+  cache.payments.forEach(p=>{ const d=localYmd(p.receivedAt); if(d) ys.add(d.slice(0,4)); });
+  cache.expenses.forEach(e=>{ if(e.date) ys.add(e.date.slice(0,4)); });
+  return [...ys].sort().reverse();
+}
+function finMonths(){
+  const ms = new Set([periodOfDate(todayStr()), FinUi.period].filter(Boolean));
+  cache.payments.forEach(p=>{ const d=localYmd(p.receivedAt); if(d) ms.add(d.slice(0,4)+d.slice(5,7)); });
+  cache.expenses.forEach(e=>{ if(e.date) ms.add(periodOfDate(e.date)); });
+  return [...ms].sort().reverse();
+}
+/* month/year/property pickers shared by the dashboard card and the P&L page */
+function finControlsHtml(){
+  finInit();
+  const props = activeProperties();
+  return '<div class="tag-row" style="align-items:center;gap:8px;flex-wrap:wrap;">'+
+    '<select id="finMode" class="btn"><option value="month" '+(FinUi.mode==='month'?'selected':'')+'>รายเดือน</option><option value="year" '+(FinUi.mode==='year'?'selected':'')+'>รายปี</option></select>'+
+    (FinUi.mode==='month'
+      ? '<select id="finMonth" class="btn" style="min-width:180px;">'+finMonths().map(m=>'<option value="'+m+'" '+(m===FinUi.period?'selected':'')+'>'+periodLabel(m)+'</option>').join('')+'</select>'
+      : '<select id="finYear" class="btn">'+finYears().map(y=>'<option value="'+y+'" '+(y===FinUi.year?'selected':'')+'>ปี '+thYear(y)+'</option>').join('')+'</select>')+
+    (props.length>1 ? '<select id="finProp" class="btn"><option value="ALL" '+(selectedPropertyId==='ALL'?'selected':'')+'>ทุกหอพัก</option>'+props.map(p=>'<option value="'+p.id+'" '+(p.id===selectedPropertyId?'selected':'')+'>'+escapeHtml(p.name)+'</option>').join('')+'</select>' : '')+
+  '</div>';
+}
+function wireFinControls(root, rerender){
+  const on = (id, fn)=>{ const el = $(id, root); if(el) el.addEventListener('change', fn); };
+  on('#finMode', e=>{ FinUi.mode = e.target.value; rerender(); });
+  on('#finMonth', e=>{ FinUi.period = e.target.value; FinUi.year = e.target.value.slice(0,4); rerender(); });
+  on('#finYear', e=>{ FinUi.year = e.target.value; rerender(); });
+  on('#finProp', e=>{ selectedPropertyId = e.target.value; route(); });
+}
 function computePropertyOverview(){
   const period = billPeriodNow();
   const props = selectedPropertyId==='ALL' ? activeProperties() : activeProperties().filter(p=>p.id===selectedPropertyId);
@@ -1296,13 +1366,12 @@ function computePropertyOverview(){
     const vac = rooms.filter(r=>r.status==='VACANT').length;
     const maint = rooms.filter(r=>r.status==='MAINTENANCE').length;
     const reserved = rooms.filter(r=>r.status==='RESERVED').length;
-    const collected = cache.payments.filter(pay=>pay.propertyId===p.id && pay.status==='active' && pay.period===period).reduce((s,x)=>s+x.amount,0);
+    const fin = pnlCompute(finRange(), p.id);
+    const collected = fin.rentIncome;
     const outstanding = cache.invoices.filter(i=>i.propertyId===p.id && ['unpaid','partial','pending_discount'].includes(i.status))
       .reduce((s,i)=>{ const paid=cache.payments.filter(x=>x.invoiceId===i.id&&x.status==='active').reduce((a,x)=>a+x.amount,0); return s+Math.max(0,i.total-paid); },0);
-    const ledgerThisPeriod = cache.expenses.filter(e=>e.propertyId===p.id && periodOfDate(e.date)===period);
-    const expenses = ledgerThisPeriod.filter(e=>expenseType(e)==='EXPENSE').reduce((s,e)=>s+e.amount,0);
-    const otherIncome = ledgerThisPeriod.filter(e=>expenseType(e)==='INCOME').reduce((s,e)=>s+e.amount,0);
-    const netProfit = collected + otherIncome - expenses;
+    const expenses = fin.expTotal, otherIncome = fin.otherIncome;
+    const netProfit = fin.net;
     return {property:p, total:rooms.length, occ, vac, maint, reserved, collected, outstanding, expenses, otherIncome, netProfit};
   });
 }
@@ -1446,7 +1515,8 @@ const NAV = [
   {id:'invoices', label:'ใบแจ้งหนี้', ic:'invoice'},
   {id:'payments', label:'การรับชำระเงิน', ic:'payment'},
   {id:'repairs', label:'แจ้งซ่อม', ic:'wrench'},
-  {id:'expenses', label:'รายรับ-รายจ่ายอื่นๆ', ic:'cash'},
+  {id:'expenses', label:'ลงค่าใช้จ่าย', ic:'cash'},
+  {id:'pnl', label:'งบกำไรขาดทุน', ic:'cash'},
   {id:'moveouts', label:'สิ้นสุดสัญญา/คืนมัดจำ', ic:'payment'},
   {id:'approvals', label:'คำขออนุมัติ', ic:'approvals'},
   {id:'audit', label:'บันทึกตรวจสอบ', ic:'audit'},
@@ -1553,7 +1623,7 @@ function renderShell(){
 
   const content = $('#content');
   const renderers = { dashboard: renderDashboard, properties: renderProperties, rooms: renderRooms, bookings: renderBookings, meters: renderMeters, invoices: renderInvoices,
-    payments: renderPayments, repairs: renderRepairs, expenses: renderExpenses, moveouts: renderMoveOuts, approvals: renderApprovals,
+    payments: renderPayments, repairs: renderRepairs, expenses: renderExpenses, pnl: renderPnl, moveouts: renderMoveOuts, approvals: renderApprovals,
     audit: renderAudit, settings: renderSettings };
   (renderers[r] || renderDashboard)(content);
   if(can('REVIEW_SLIP') && !SlipUi.countLoaded){
@@ -1589,10 +1659,18 @@ function renderDashboard(root){
       kpi('ความผิดปกติ', critCount>0?'bad':(warnCount>0?'warn':'good'), (critCount+warnCount)+' รายการ', critCount+' วิกฤต · '+warnCount+' เฝ้าระวัง')+
     '</div>'+
 
-    '<div class="card"><div class="card-head"><div><h3>ภาพรวมห้องพักแยกตามหอ</h3><div class="desc">จำนวนห้อง สถานะเข้าพัก และสรุปกำไร-ขาดทุนแยกตามหอพัก (งวดนี้)</div></div></div>'+
+    (()=>{ if(role()==='STAFF') return ''; const f = pnlCompute(finRange(), selectedPropertyId);
+      return '<div class="card" id="finCard"><div class="card-head"><div><h3>รายได้ที่รับชำระแล้ว — '+finLabel()+'</h3><div class="desc">นับตามวันที่รับเงิน · '+(selectedPropertyId==='ALL'?'ทุกหอพัก':escapeHtml((propertyById(selectedPropertyId)||{}).name||''))+' · '+f.payCount+' รายการ</div></div>'+finControlsHtml()+'</div>'+
+        '<div class="card-body"><div class="kpi-grid" style="margin:0;">'+
+          kpi('รายได้ค่าเช่า/น้ำ-ไฟ ที่รับชำระแล้ว','good', money(f.rentIncome)+' ฿', f.payCount+' รายการชำระ')+
+          kpi('รายได้อื่น','', money(f.otherIncome)+' ฿', f.otherItems.length+' รายการ')+
+          kpi('ค่าใช้จ่าย','bad', money(f.expTotal)+' ฿', f.expCount+' รายการ')+
+          kpi('กำไร/ขาดทุนสุทธิ', f.net<0?'bad':'good', (f.net<0?'-':'')+money(Math.abs(f.net))+' ฿', 'รายได้รวม '+money(f.totalIncome)+' ฿')+
+        '</div>'+(role()!=='STAFF'?'<div style="margin-top:10px;"><a class="btn sm" href="#pnl">ดูงบกำไรขาดทุนฉบับเต็ม ›</a></div>':'')+'</div></div>'; })()+
+    '<div class="card"><div class="card-head"><div><h3>ภาพรวมห้องพักแยกตามหอ</h3><div class="desc">จำนวนห้อง สถานะเข้าพัก และสรุปกำไร-ขาดทุนแยกตามหอพัก (ตามเดือน/ปีที่เลือกด้านบน)</div></div></div>'+
       '<div class="tbl-wrap"><table class="grid"><thead><tr>'+
         '<th>หอพัก</th><th>ห้องทั้งหมด</th><th>มีผู้เช่า</th><th>ห้องว่าง</th><th>จองแล้ว</th><th>ปิดซ่อมบำรุง</th>'+
-        '<th>รายได้ค่าเช่า/น้ำ-ไฟ (งวดนี้)</th><th>รายได้อื่น (งวดนี้)</th><th>ค่าใช้จ่าย (งวดนี้)</th><th>กำไร/ขาดทุนสุทธิ (งวดนี้)</th><th>ค้างชำระสะสม</th>'+
+        '<th>รายได้ค่าเช่า/น้ำ-ไฟ ('+finLabel()+')</th><th>รายได้อื่น</th><th>ค่าใช้จ่าย</th><th>กำไร/ขาดทุนสุทธิ ('+finLabel()+')</th><th>ค้างชำระสะสม</th>'+
       '</tr></thead><tbody>'+
       (overview.length? overview.map(o=>
         '<tr><td><strong>'+escapeHtml(o.property.name)+'</strong> <span class="footnote" style="margin:0;">('+o.property.code+')</span></td>'+
@@ -1605,7 +1683,7 @@ function renderDashboard(root){
         '<td class="num" style="'+(o.outstanding>0?'color:var(--danger);':'')+'">'+money(o.outstanding)+' ฿</td></tr>'
       ).join('') : '<tr><td colspan="11" class="empty-row">ยังไม่มีหอพักในระบบ</td></tr>')+
       '</tbody></table></div>'+
-      '<div class="card-body" style="font-size:11.5px;color:var(--text-muted);">กำไร/ขาดทุนสุทธิ = รายได้ที่รับชำระจริง (ค่าเช่า/น้ำ/ไฟ) + รายได้อื่น − ค่าใช้จ่ายที่บันทึกในงวดนี้ (รวมบิลค่าน้ำ-ไฟรวมของหอที่จ่ายให้การไฟฟ้า/ประปา) · ดูรายละเอียดและเพิ่มรายการได้ที่เมนู “รายรับ-รายจ่ายอื่นๆ”</div></div>'+
+      '<div class="card-body" style="font-size:11.5px;color:var(--text-muted);">กำไร/ขาดทุนสุทธิ = รายได้ที่รับชำระจริง (ค่าเช่า/น้ำ/ไฟ) + รายได้อื่น − ค่าใช้จ่ายที่บันทึกในช่วงที่เลือก (รวมบิลค่าน้ำ-ไฟรวมของหอที่จ่ายให้การไฟฟ้า/ประปา) · ดูรายละเอียดและเพิ่มรายการได้ที่เมนู “ลงค่าใช้จ่าย”</div></div>'+
 
     '<div class="field-row">'+
       '<div class="card"><div class="card-head"><div><h3>ห้องที่จองไว้ (รอเข้าพัก)</h3><div class="desc">'+bookedRooms.length+' ห้อง</div></div></div><div class="card-body flush" id="bookedWrap"></div></div>'+
@@ -1646,6 +1724,7 @@ function renderDashboard(root){
   }).join('');
   $all('[data-nav]', bWrap).concat($all('[data-nav]', oWrap)).forEach(el=>el.addEventListener('click', ()=>{ location.hash = '#'+el.dataset.nav; }));
 
+  if($('#finCard')) wireFinControls($('#finCard'), ()=>renderDashboard(root));
   const aWrap = $('#alertsWrap');
   if(alerts.length===0){ aWrap.innerHTML = '<div class="empty-row">ไม่พบความผิดปกติในระบบขณะนี้</div>'; }
   else {
@@ -3084,7 +3163,7 @@ function renderRepairs(root){
     }, bodyHtml:
       '<p style="font-size:13px;color:var(--text-muted);">จุดที่ซ่อม: '+escapeHtml(rq.point)+'</p>'+
       '<div class="field"><label>ค่าใช้จ่ายในการซ่อม (บาท)</label><input name="cost" type="number" min="0" step="0.01" required value="0">'+
-      '<p class="hint">ถ้ามีค่าใช้จ่าย ระบบจะบันทึกเข้า "รายรับ-รายจ่ายอื่นๆ" ให้อัตโนมัติ</p></div>'+
+      '<p class="hint">ถ้ามีค่าใช้จ่าย ระบบจะบันทึกเข้าเมนู "ลงค่าใช้จ่าย" (หมวดค่าซ่อมบำรุง) ให้อัตโนมัติ</p></div>'+
       '<div class="field"><label>หมายเหตุ</label><textarea name="costNote" placeholder="เช่น เปลี่ยนคอมเพรสเซอร์แอร์"></textarea></div>'});
   }));
 
@@ -3121,32 +3200,72 @@ function renderRepairs(root){
    own water/electric bills and other overhead here as ค่าใช้จ่าย, and non-rent income
    (coin laundry, parking, etc.) as รายได้อื่น.
    ============================================================ */
+const ExpUi = { period:'' };   // '' = every month
+function expenseFormHtml(e, props){
+  const curType = e ? expenseType(e) : 'EXPENSE';
+  const cat = e ? (expenseCat(e)||'OTHER') : 'ELECTRIC';
+  return (props.length>1? '<div class="field"><label>หอพัก</label><select name="propertyId">'+props.map(p=>'<option value="'+p.id+'" '+(p.id===(e?e.propertyId:selectedPropertyId)?'selected':'')+'>'+escapeHtml(p.name)+'</option>').join('')+'</select></div>'
+      : '<input type="hidden" name="propertyId" value="'+(e?e.propertyId:(props[0]?props[0].id:''))+'">')+
+    '<div class="field"><label>ประเภทรายการ</label><div class="radio-row" id="expTypeRow">'+
+      '<label class="radio-opt '+(curType==='EXPENSE'?'checked':'')+'"><input type="radio" name="type" value="EXPENSE" '+(curType==='EXPENSE'?'checked':'')+'> ค่าใช้จ่าย</label>'+
+      '<label class="radio-opt '+(curType==='INCOME'?'checked':'')+'"><input type="radio" name="type" value="INCOME" '+(curType==='INCOME'?'checked':'')+'> รายได้อื่น</label>'+
+    '</div></div>'+
+    '<div class="field" id="expCatBox"><label>หมวดค่าใช้จ่าย</label><select name="category">'+EXPENSE_CATS.map(c=>'<option value="'+c.id+'" '+(c.id===cat?'selected':'')+'>'+c.label+'</option>').join('')+'</select></div>'+
+    '<div class="field"><label>วันที่ทำรายการ</label><input name="date" type="date" required value="'+(e?e.date:todayStr())+'"></div>'+
+    '<div class="field"><label id="expItemLabel">รายละเอียด</label><input name="item" id="expItemInput" value="'+(e && !(expenseType(e)==='EXPENSE' && e.item===EXPENSE_CAT_LABEL[cat]) ? escapeHtml(e.item) : '')+'"></div>'+
+    '<div class="field"><label>ยอดเงิน (บาท)</label><input name="amount" type="number" min="0.01" step="0.01" required value="'+(e?e.amount:'')+'"></div>'+
+    '<div class="field"><label>หมายเหตุ</label><input name="note" placeholder="ไม่บังคับ" value="'+(e?escapeHtml(e.note||''):'')+'"></div>';
+}
+/* radio style, category box visibility, and which wording/required-ness the detail field gets */
+function wireExpenseTypeToggle(modalEl){
+  const row = $('#expTypeRow', modalEl); if(!row) return;
+  const itemLabel = $('#expItemLabel', modalEl), itemInput = $('#expItemInput', modalEl), catBox = $('#expCatBox', modalEl), catSel = modalEl.querySelector('[name=category]');
+  function sync(){
+    const income = row.querySelector('input:checked').value==='INCOME';
+    $all('.radio-opt', row).forEach(o=>o.classList.toggle('checked', o.querySelector('input').checked));
+    catBox.style.display = income ? 'none' : '';
+    const other = !income && catSel.value==='OTHER';
+    itemLabel.textContent = income ? 'รายการรับ (บังคับ)' : (other ? 'รายละเอียดค่าใช้จ่าย (บังคับ)' : 'รายละเอียด (ไม่บังคับ)');
+    itemInput.required = income || other;
+    itemInput.placeholder = income ? 'เช่น ค่าเครื่องซักผ้าหยอดเหรียญ, ค่าที่จอดรถ' : (other ? 'ระบุว่าเป็นค่าอะไร' : 'เช่น บิลเดือน ต.ค. / เลขที่ใบเสร็จ');
+  }
+  $all('input[type=radio]', row).forEach(r=>r.addEventListener('change', sync));
+  catSel.addEventListener('change', sync); sync();
+}
 function renderExpenses(root){
   const props = activeProperties();
   const scoped = selectedPropertyId==='ALL' ? cache.expenses : cache.expenses.filter(e=>e.propertyId===selectedPropertyId);
-  const rows = scoped.slice().sort((a,b)=> (b.date||'')<(a.date||'')?-1:1);
-  const totalExpense = rows.filter(e=>expenseType(e)==='EXPENSE').reduce((s,e)=>s+e.amount,0);
+  const months = [...new Set([...scoped.map(e=>periodOfDate(e.date)).filter(Boolean), periodOfDate(todayStr())])].sort().reverse();
+  if(ExpUi.period && !months.includes(ExpUi.period)) ExpUi.period = '';
+  const rows = scoped.filter(e=>!ExpUi.period || periodOfDate(e.date)===ExpUi.period).slice().sort((a,b)=> (b.date||'')<(a.date||'')?1:((b.date||'')>(a.date||'')?-1:((b.createdAt||'')<(a.createdAt||'')?-1:1)));
+  const exps = rows.filter(e=>expenseType(e)==='EXPENSE');
+  const totalExpense = exps.reduce((s,e)=>s+e.amount,0);
   const totalIncome = rows.filter(e=>expenseType(e)==='INCOME').reduce((s,e)=>s+e.amount,0);
+  const catTot = {}; exps.forEach(e=>{ const c = expenseCat(e); catTot[c] = (catTot[c]||0)+e.amount; });
 
   root.innerHTML =
-    '<div class="section-title"><div><h2>รายรับ-รายจ่ายอื่นๆ</h2><div class="desc">ค่าใช้จ่ายของกิจการ (รวมค่าน้ำ-ไฟรวมของหอที่จ่ายให้การไฟฟ้า/ประปา) และรายได้อื่นนอกเหนือค่าเช่า (เช่น เครื่องซักผ้าหยอดเหรียญ) — ใช้คำนวณกำไร-ขาดทุนในแดชบอร์ด · พนักงานบันทึกรายการใหม่ได้ แก้ไข/ลบทำได้เฉพาะผู้ดูแลระบบ/เจ้าของกิจการ</div></div>'+
-      (can('ADD_EXPENSE')? '<button class="btn primary" id="addExpBtn">'+icon('plus')+' เพิ่มรายการ</button>':'')+'</div>'+
-    '<div class="kpi-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:14px;">'+
-      kpi('รวมค่าใช้จ่าย','bad', money(totalExpense)+' ฿', rows.filter(e=>expenseType(e)==='EXPENSE').length+' รายการ')+
+    '<div class="section-title"><div><h2>ลงค่าใช้จ่าย</h2><div class="desc">บันทึกค่าใช้จ่ายของหอพักตามหมวด (ไฟฟ้า น้ำประปา ขยะ ตู้แดง แม่บ้าน อินเทอร์เน็ต อื่นๆ) และรายได้อื่นนอกเหนือค่าเช่า — นำไปสรุปในเมนู งบกำไรขาดทุน</div></div>'+
+      '<div class="tag-row">'+
+      '<select id="expMonthSel" class="btn"><option value="">ทุกเดือน</option>'+months.map(m=>'<option value="'+m+'" '+(m===ExpUi.period?'selected':'')+'>'+periodLabel(m)+'</option>').join('')+'</select>'+
+      (can('ADD_EXPENSE')? '<button class="btn primary" id="addExpBtn">'+icon('plus')+' ลงค่าใช้จ่าย / รายได้อื่น</button>':'')+'</div></div>'+
+    '<div class="kpi-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:10px;">'+
+      kpi('รวมค่าใช้จ่าย','bad', money(totalExpense)+' ฿', exps.length+' รายการ'+(ExpUi.period?' · '+periodLabel(ExpUi.period):''))+
       kpi('รวมรายได้อื่น','good', money(totalIncome)+' ฿', rows.filter(e=>expenseType(e)==='INCOME').length+' รายการ')+
     '</div>'+
+    '<div class="tag-row" style="margin-bottom:12px;">'+EXPENSE_CATS.filter(c=>catTot[c.id]).map(c=>'<span class="pill muted">'+c.label+' '+money(catTot[c.id])+'</span>').join('')+'</div>'+
     '<div class="card"><div class="tbl-wrap"><table class="grid"><thead><tr>'+
-      (props.length>1?'<th>หอพัก</th>':'')+'<th>ประเภท</th><th>วันที่</th><th>รายการ</th><th>หมายเหตุ</th><th>ยอดเงิน</th><th></th>'+
+      (props.length>1?'<th>หอพัก</th>':'')+'<th>ประเภท</th><th>หมวด</th><th>วันที่</th><th>รายละเอียด</th><th>หมายเหตุ</th><th>ยอดเงิน</th><th></th>'+
     '</tr></thead><tbody id="expBody"></tbody></table></div></div>';
 
   const body = $('#expBody');
-  const colspan = props.length>1? 7:6;
+  const colspan = props.length>1? 8:7;
   if(!rows.length){ body.innerHTML = '<tr><td colspan="'+colspan+'" class="empty-row">ยังไม่มีรายการ</td></tr>'; }
   else body.innerHTML = rows.map(e=>{
     const prop = propertyById(e.propertyId);
     const isIncome = expenseType(e)==='INCOME';
     return '<tr>'+(props.length>1?'<td>'+(prop?escapeHtml(prop.name):'-')+'</td>':'')+
       '<td><span class="pill '+(isIncome?'ok':'bad')+'">'+LEDGER_TYPE_LABEL[expenseType(e)]+'</span></td>'+
+      '<td>'+(isIncome?'-':EXPENSE_CAT_LABEL[expenseCat(e)])+'</td>'+
       '<td>'+fmtDate(e.date)+'</td><td>'+escapeHtml(e.item)+(e.repairRequestId?' <span class="pill muted" style="padding:1px 6px;">แจ้งซ่อม</span>':'')+'</td>'+
       '<td style="font-size:12.5px;color:var(--text-muted);">'+escapeHtml(e.note||'-')+'</td>'+
       '<td class="num" style="'+(isIncome?'color:var(--success);':'')+'">'+(isIncome?'+':'-')+money(e.amount)+'</td>'+
@@ -3154,6 +3273,7 @@ function renderExpenses(root){
         (can('MANAGE_EXPENSES')? '<button class="btn sm" data-editexp="'+e.id+'">แก้ไข</button> <button class="btn sm" data-delexp="'+e.id+'">'+icon('trash')+'</button>':'')+
       '</td></tr>';
   }).join('');
+  $('#expMonthSel').addEventListener('change', e=>{ ExpUi.period = e.target.value; renderExpenses(root); });
   $all('[data-editexp]', body).forEach(b=>b.addEventListener('click', ()=>openEditExpenseModal(cache.expenses.find(x=>x.id===b.dataset.editexp))));
   $all('[data-delexp]', body).forEach(b=>b.addEventListener('click', ()=>{
     const e = cache.expenses.find(x=>x.id===b.dataset.delexp);
@@ -3162,59 +3282,79 @@ function renderExpenses(root){
   }));
 
   if($('#addExpBtn')) $('#addExpBtn').addEventListener('click', ()=>{
-    const modalEl = openModal({title:'เพิ่มรายการรายรับ-รายจ่าย', submitLabel:'บันทึก', onSubmit: async fd=>{
-      await createExpense({propertyId:fd.get('propertyId'), type:fd.get('type'), date:fd.get('date'), item:fd.get('item'), amount:fd.get('amount'), note:fd.get('note')});
-    }, bodyHtml:
-      (props.length>1? '<div class="field"><label>หอพัก</label><select name="propertyId">'+props.map(p=>'<option value="'+p.id+'" '+(p.id===selectedPropertyId?'selected':'')+'>'+escapeHtml(p.name)+'</option>').join('')+'</select></div>'
-        : '<input type="hidden" name="propertyId" value="'+(props[0]?props[0].id:'')+'">')+
-      '<div class="field"><label>ประเภทรายการ</label><div class="radio-row" id="expTypeRow">'+
-        '<label class="radio-opt checked"><input type="radio" name="type" value="EXPENSE" checked> ค่าใช้จ่าย</label>'+
-        '<label class="radio-opt"><input type="radio" name="type" value="INCOME"> รายได้อื่น</label>'+
-      '</div></div>'+
-      '<div class="field"><label>วันที่ทำรายการ</label><input name="date" type="date" required value="'+todayStr()+'"></div>'+
-      '<div class="field"><label id="expItemLabel">รายการจ่าย</label><input name="item" id="expItemInput" required placeholder="เช่น ค่าน้ำ-ไฟรวมของหอ (บิลการไฟฟ้า/ประปา), ค่าน้ำยาทำความสะอาด, ค่าจ้างพนักงาน"></div>'+
-      '<div class="field"><label>ยอดเงิน (บาท)</label><input name="amount" type="number" min="0.01" step="0.01" required></div>'+
-      '<div class="field"><label>หมายเหตุ</label><input name="note" placeholder="ไม่บังคับ"></div>'});
+    const modalEl = openModal({title:'ลงค่าใช้จ่าย / รายได้อื่น', submitLabel:'บันทึก', onSubmit: async fd=>{
+      await createExpense({propertyId:fd.get('propertyId'), type:fd.get('type'), category:fd.get('category'), date:fd.get('date'), item:fd.get('item'), amount:fd.get('amount'), note:fd.get('note')});
+    }, bodyHtml: expenseFormHtml(null, props)});
     wireExpenseTypeToggle(modalEl);
   });
 }
-/* Toggles the radio-opt "checked" style and swaps the item-field label/placeholder
-   between expense examples (utility bills, upkeep) and income examples (coin laundry,
-   parking) as the user switches ประเภทรายการ. */
-function wireExpenseTypeToggle(modalEl){
-  const row = $('#expTypeRow', modalEl); if(!row) return;
-  const itemLabel = $('#expItemLabel', modalEl);
-  const itemInput = $('#expItemInput', modalEl);
-  $all('input[type=radio]', row).forEach(r=>r.addEventListener('change', ()=>{
-    $all('.radio-opt', row).forEach(o=>o.classList.toggle('checked', o.querySelector('input').checked));
-    if(r.checked && r.value==='INCOME'){
-      itemLabel.textContent = 'รายการรับ';
-      itemInput.placeholder = 'เช่น ค่าเครื่องซักผ้าหยอดเหรียญ, ค่าที่จอดรถ, ค่าขายของ';
-    }else if(r.checked){
-      itemLabel.textContent = 'รายการจ่าย';
-      itemInput.placeholder = 'เช่น ค่าน้ำ-ไฟรวมของหอ (บิลการไฟฟ้า/ประปา), ค่าน้ำยาทำความสะอาด, ค่าจ้างพนักงาน';
-    }
-  }));
-}
 function openEditExpenseModal(e){
   const props = activeProperties();
-  const curType = expenseType(e);
   const modalEl = openModal({title:'แก้ไขรายการ', submitLabel:'บันทึก', onSubmit: async fd=>{
     const prop = propertyById(fd.get('propertyId'));
-    await updateExpense(e, {propertyId:fd.get('propertyId'), propertyCode: prop?prop.code:'', type:fd.get('type'), date:fd.get('date'),
-      item:fd.get('item').trim(), amount:Number(fd.get('amount')), note:fd.get('note').trim()});
-  }, bodyHtml:
-    (props.length>1? '<div class="field"><label>หอพัก</label><select name="propertyId">'+props.map(p=>'<option value="'+p.id+'" '+(p.id===e.propertyId?'selected':'')+'>'+escapeHtml(p.name)+'</option>').join('')+'</select></div>'
-      : '<input type="hidden" name="propertyId" value="'+e.propertyId+'">')+
-    '<div class="field"><label>ประเภทรายการ</label><div class="radio-row" id="expTypeRow">'+
-      '<label class="radio-opt '+(curType==='EXPENSE'?'checked':'')+'"><input type="radio" name="type" value="EXPENSE" '+(curType==='EXPENSE'?'checked':'')+'> ค่าใช้จ่าย</label>'+
-      '<label class="radio-opt '+(curType==='INCOME'?'checked':'')+'"><input type="radio" name="type" value="INCOME" '+(curType==='INCOME'?'checked':'')+'> รายได้อื่น</label>'+
-    '</div></div>'+
-    '<div class="field"><label>วันที่ทำรายการ</label><input name="date" type="date" required value="'+e.date+'"></div>'+
-    '<div class="field"><label id="expItemLabel">'+(curType==='INCOME'?'รายการรับ':'รายการจ่าย')+'</label><input name="item" id="expItemInput" required value="'+escapeHtml(e.item)+'"></div>'+
-    '<div class="field"><label>ยอดเงิน (บาท)</label><input name="amount" type="number" min="0.01" step="0.01" required value="'+e.amount+'"></div>'+
-    '<div class="field"><label>หมายเหตุ</label><input name="note" value="'+escapeHtml(e.note||'')+'"></div>'});
+    await updateExpense(e, {propertyId:fd.get('propertyId'), propertyCode: prop?prop.code:'', type:fd.get('type'), category:fd.get('category'), date:fd.get('date'),
+      item:fd.get('item'), amount:Number(fd.get('amount')), note:fd.get('note').trim()});
+  }, bodyHtml: expenseFormHtml(e, props)});
   wireExpenseTypeToggle(modalEl);
+}
+
+/* ============================================================
+   VIEW: PROFIT & LOSS (งบกำไรขาดทุน) — by month or year, all properties or one
+   income = payments received in the period (cash basis) + other income; expenses by category from the ledger.
+   Not included: deposits held, amounts deducted from deposits at move-out, unpaid invoices.
+   ============================================================ */
+function renderPnl(root){
+  const range = finRange(); const label = finLabel();
+  const f = pnlCompute(range, selectedPropertyId);
+  const propName = selectedPropertyId==='ALL' ? 'ทุกหอพัก' : ((propertyById(selectedPropertyId)||{}).name||'');
+  const sgn = n => (n<0?'-':'')+money(Math.abs(n));
+  const lineRow = (name, amt, opts={})=>'<tr style="'+(opts.bold?'font-weight:800;background:var(--surface-2,rgba(0,0,0,.03));':'')+'"><td style="padding-left:'+(opts.indent?28:12)+'px;">'+name+'</td><td class="num" style="'+(opts.color||'')+'">'+(amt===null?'':sgn(amt))+'</td>'+
+    '<td class="num footnote">'+(opts.pct!=null && f.totalIncome>0 ? (Math.round(opts.pct/f.totalIncome*1000)/10)+'%' : '')+'</td></tr>';
+  const catRows = EXPENSE_CATS.map(c=>lineRow(c.label, f.byCat[c.id], {indent:true, pct:f.byCat[c.id]})).join('');
+  const incomeOther = f.otherItems.map(x=>lineRow(escapeHtml(x.item), x.amount, {indent:true, pct:x.amount})).join('');
+
+  let extra = '';
+  if(FinUi.mode==='year'){
+    const rowsM = [];
+    for(let m=1;m<=12;m++){ const per = FinUi.year+String(m).padStart(2,'0'); rowsM.push({per, v:pnlCompute(monthRange(per), selectedPropertyId)}); }
+    const tot = rowsM.reduce((a,x)=>({r:a.r+x.v.rentIncome,o:a.o+x.v.otherIncome,e:a.e+x.v.expTotal,n:a.n+x.v.net}),{r:0,o:0,e:0,n:0});
+    extra += '<div class="card"><div class="card-head"><div><h3>แยกรายเดือน — ปี '+thYear(FinUi.year)+'</h3></div></div><div class="tbl-wrap"><table class="grid"><thead><tr><th>เดือน</th><th>ค่าเช่า/น้ำ-ไฟ ที่รับชำระ</th><th>รายได้อื่น</th><th>ค่าใช้จ่าย</th><th>กำไร/ขาดทุน</th></tr></thead><tbody>'+
+      rowsM.map(x=>'<tr><td>'+periodLabel(x.per)+'</td><td class="num">'+money(x.v.rentIncome)+'</td><td class="num">'+money(x.v.otherIncome)+'</td><td class="num">'+money(x.v.expTotal)+'</td><td class="num" style="font-weight:700;'+(x.v.net<0?'color:var(--danger);':'')+'">'+sgn(x.v.net)+'</td></tr>').join('')+
+      '<tr style="font-weight:800;"><td>รวมทั้งปี</td><td class="num">'+money(tot.r)+'</td><td class="num">'+money(tot.o)+'</td><td class="num">'+money(tot.e)+'</td><td class="num" style="'+(tot.n<0?'color:var(--danger);':'color:var(--success);')+'">'+sgn(tot.n)+'</td></tr></tbody></table></div></div>';
+  }
+  const props = activeProperties();
+  if(selectedPropertyId==='ALL' && props.length>1){
+    extra += '<div class="card"><div class="card-head"><div><h3>แยกตามหอพัก — '+label+'</h3></div></div><div class="tbl-wrap"><table class="grid"><thead><tr><th>หอพัก</th><th>ค่าเช่า/น้ำ-ไฟ ที่รับชำระ</th><th>รายได้อื่น</th><th>ค่าใช้จ่าย</th><th>กำไร/ขาดทุน</th></tr></thead><tbody>'+
+      props.map(p=>{ const v = pnlCompute(range, p.id); return '<tr><td><strong>'+escapeHtml(p.name)+'</strong></td><td class="num">'+money(v.rentIncome)+'</td><td class="num">'+money(v.otherIncome)+'</td><td class="num">'+money(v.expTotal)+'</td><td class="num" style="font-weight:700;'+(v.net<0?'color:var(--danger);':'')+'">'+sgn(v.net)+'</td></tr>'; }).join('')+'</tbody></table></div></div>';
+  }
+
+  root.innerHTML =
+    '<div class="section-title"><div><h2>งบกำไรขาดทุน</h2><div class="desc">'+label+' · '+escapeHtml(propName)+' — นับรายได้ตามวันที่รับเงินจริง</div></div>'+
+      '<div class="tag-row">'+finControlsHtml()+'<button class="btn" id="pnlCsv">ดาวน์โหลด CSV</button></div></div>'+
+    '<div class="kpi-grid" style="margin-bottom:12px;">'+
+      kpi('รายได้รวม','good', money(f.totalIncome)+' ฿', 'ค่าเช่า/น้ำ-ไฟ '+money(f.rentIncome)+' · อื่นๆ '+money(f.otherIncome))+
+      kpi('ค่าใช้จ่ายรวม','bad', money(f.expTotal)+' ฿', f.expCount+' รายการ')+
+      kpi(f.net<0?'ขาดทุนสุทธิ':'กำไรสุทธิ', f.net<0?'bad':'good', sgn(f.net)+' ฿', f.totalIncome>0 ? 'อัตรากำไร '+(Math.round(f.net/f.totalIncome*1000)/10)+'%' : '-')+
+    '</div>'+
+    '<div class="card"><div class="tbl-wrap"><table class="grid"><thead><tr><th>รายการ</th><th style="text-align:right;">บาท</th><th style="text-align:right;">% ของรายได้</th></tr></thead><tbody>'+
+      lineRow('รายได้', null, {bold:true})+
+      lineRow('ค่าเช่า/ค่าน้ำ-ไฟ ที่รับชำระแล้ว ('+f.payCount+' รายการ)', f.rentIncome, {indent:true, pct:f.rentIncome})+
+      incomeOther+
+      lineRow('รวมรายได้', f.totalIncome, {bold:true, color:'color:var(--success);'})+
+      lineRow('ค่าใช้จ่าย', null, {bold:true})+
+      catRows+
+      lineRow('รวมค่าใช้จ่าย', f.expTotal, {bold:true, color:'color:var(--danger);'})+
+      lineRow(f.net<0?'ขาดทุนสุทธิ':'กำไรสุทธิ', f.net, {bold:true, color:f.net<0?'color:var(--danger);':'color:var(--success);'})+
+    '</tbody></table></div></div>'+extra+
+    '<p class="footnote" style="margin-top:10px;">หมายเหตุ: รายได้นับจากเงินที่รับชำระจริงตามวันที่รับ (ค่าเช่าที่จ่ายล่วงหน้านับรวมในเดือนที่รับเงิน) · ยังไม่รวมเงินมัดจำที่รับไว้ ยอดที่หักจากมัดจำตอนย้ายออก และใบแจ้งหนี้ที่ยังไม่ชำระ</p>';
+  wireFinControls(root, ()=>renderPnl(root));
+  $('#pnlCsv').addEventListener('click', ()=>{
+    const q = v=>'"'+String(v).replace(/"/g,'""')+'"';
+    const lines = [['งบกำไรขาดทุน',label,propName],[],['รายการ','บาท'],['ค่าเช่า/ค่าน้ำ-ไฟ ที่รับชำระแล้ว',f.rentIncome], ...f.otherItems.map(x=>['รายได้อื่น: '+x.item,x.amount]), ['รวมรายได้',f.totalIncome],
+      ...EXPENSE_CATS.map(c=>[c.label,f.byCat[c.id]]), ['รวมค่าใช้จ่าย',f.expTotal], [f.net<0?'ขาดทุนสุทธิ':'กำไรสุทธิ',f.net]];
+    const blob = new Blob(['﻿'+lines.map(r=>r.map(q).join(',')).join('\r\n')], {type:'text/csv;charset=utf-8'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'pnl_'+(FinUi.mode==='year'?FinUi.year:FinUi.period)+'.csv'; document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  });
 }
 
 /* ============================================================
