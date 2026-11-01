@@ -329,6 +329,12 @@ function expenseType(e){ return e && e.type==='INCOME' ? 'INCOME' : 'EXPENSE'; }
 function roomWaterMode(room){ if(!room) return 'SEPARATE'; return room.waterMode || room.billingMode || 'SEPARATE'; }
 function roomElecMode(room){ if(!room) return 'SEPARATE'; const m = room.elecMode || room.billingMode || 'SEPARATE'; return m==='FLAT' ? 'SEPARATE' : m; }
 function roomWaterFlatFee(room){ return (room && room.waterFlatFee!=null) ? Number(room.waterFlatFee) : 100; }
+/* Minimum water charge for metered (SEPARATE) rooms: e.g. 100 baht = the first 4 units (at 25/unit); usage above that is billed at the actual rate. */
+function roomWaterMinFee(room){ const n = Number(room && room.waterMinFee); return Number.isFinite(n) && n>0 ? n : 0; }
+function calcSeparateWater(room, usage, rate){
+  const actual = Math.round(Number(usage||0)*Number(rate||0)), min = roomWaterMinFee(room);
+  return { amount: Math.max(actual, min), minApplied: min>0 && actual<min, minFee: min };
+}
 const APPROVAL_TYPE_LABEL = {
   VOID_PAYMENT:'ยกเลิกการรับชำระเงิน', REFUND:'คืนเงิน', INVOICE_CANCEL:'ยกเลิกใบแจ้งหนี้',
   DEBT_WAIVER:'ยกหนี้/ยกเว้นหนี้', DISCOUNT:'ขออนุมัติส่วนลด'
@@ -913,8 +919,8 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   if(roomElecMode(room)==='SEPARATE' && !elec) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์ไฟเดือน '+periodLabel(readPeriod)+' (สำหรับค่าเช่าเดือน '+periodLabel(period)+') — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
   const waterMode = roomWaterMode(room);
   const elecMode = roomElecMode(room);
-  let waterAmount = 0;
-  if(waterMode==='SEPARATE') waterAmount = water ? Math.round(water.usage*cfg.waterRate) : 0;
+  let waterAmount = 0, waterMinApplied = false;
+  if(waterMode==='SEPARATE' && water){ const wc = calcSeparateWater(room, water.usage, cfg.waterRate); waterAmount = wc.amount; waterMinApplied = wc.minApplied; }
   else if(waterMode==='FLAT') waterAmount = roomWaterFlatFee(room);
   const elecAmount = (elecMode==='SEPARATE' && elec) ? Math.round(elec.usage*cfg.elecRate) : 0;
   // prepaid months: rent + common fee x N on one bill; water/electric are only for the first month (later months bill utilities only)
@@ -937,7 +943,7 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: room.propertyId, propertyCode: prop.code,
     roomId, roomCode, period, readingPeriod: readPeriod, waterMode, elecMode, rentAmount:rent,
     prepayMonths: n>1? n : 0, prepayTo: n>1? periodAdd(period,n-1) : '', prepaidBy: prepaid? cover.id : '', prepaidByNumber: prepaid? (cover.invoiceNumber||'') : '',
-    waterUnits: water?water.usage:0, waterAmount, elecUnits: elec?elec.usage:0, elecAmount, commonFee,
+    waterUnits: water?water.usage:0, waterAmount, waterMinFee: waterMode==='SEPARATE' ? roomWaterMinFee(room) : 0, waterMinApplied, elecUnits: elec?elec.usage:0, elecAmount, commonFee,
     discount, discountReason: discountReason||'', discountState, discountApprovedBy: discountState==='approved'? Session.user.name : '',
     total, status: discountState==='pending' ? 'pending_discount' : 'unpaid',
     createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
@@ -991,7 +997,7 @@ async function reissueInvoice(oldInvoice){
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: oldInvoice.propertyId, propertyCode: prop.code,
     roomId: oldInvoice.roomId, roomCode: oldInvoice.roomCode, period: oldInvoice.period, waterMode: oldInvoice.waterMode, elecMode: oldInvoice.elecMode,
     prepayMonths: oldInvoice.prepayMonths||0, prepayTo: oldInvoice.prepayTo||'', prepaidBy: oldInvoice.prepaidBy||'', prepaidByNumber: oldInvoice.prepaidByNumber||'',
-    rentAmount: rentNew, waterUnits: oldInvoice.waterUnits, waterAmount: oldInvoice.waterAmount,
+    rentAmount: rentNew, waterUnits: oldInvoice.waterUnits, waterAmount: oldInvoice.waterAmount, waterMinFee: oldInvoice.waterMinFee||0, waterMinApplied: !!oldInvoice.waterMinApplied,
     elecUnits: oldInvoice.elecUnits, elecAmount: oldInvoice.elecAmount, commonFee: commonNew,
     discount:0, discountReason:'', discountState:'none', discountApprovedBy:'',
     total: rentNew+oldInvoice.waterAmount+oldInvoice.elecAmount+commonNew,
@@ -1876,7 +1882,7 @@ function renderRooms(root){
       (selectedPropertyId==='ALL'? '<td style="white-space:nowrap;">'+(prop?escapeHtml(prop.name):'-')+'</td>':'')+
       '<td><strong>'+r.code+'</strong></td>'+
       '<td><span class="pill muted">'+ROOM_TYPE_LABEL[r.roomType]+'</span></td>'+
-      '<td style="white-space:nowrap;"><span class="pill '+(roomWaterMode(r)==='SEPARATE'?'muted':'info')+'" style="padding:1px 6px;">น้ำ: '+WATER_MODE_LABEL[roomWaterMode(r)]+(roomWaterMode(r)==='FLAT'?' '+money(roomWaterFlatFee(r))+'฿':'')+'</span><br>'+
+      '<td style="white-space:nowrap;"><span class="pill '+(roomWaterMode(r)==='SEPARATE'?'muted':'info')+'" style="padding:1px 6px;">น้ำ: '+WATER_MODE_LABEL[roomWaterMode(r)]+(roomWaterMode(r)==='FLAT'?' '+money(roomWaterFlatFee(r))+'฿':(roomWaterMode(r)==='SEPARATE'&&roomWaterMinFee(r)?' · ขั้นต่ำ '+money(roomWaterMinFee(r))+'฿':''))+'</span><br>'+
       '<span class="pill '+(roomElecMode(r)==='SEPARATE'?'muted':'info')+'" style="padding:1px 6px;margin-top:2px;">ไฟ: '+ELEC_MODE_LABEL[roomElecMode(r)]+'</span></td>'+
       '<td>'+statusPill(r.status)+'</td>'+
       '<td>'+(lease? escapeHtml(lease.tenantName) : (r.status==='RESERVED'? '<span class="pill info">มีผู้จองแล้ว</span>' : '<span class="pill muted">ไม่มีผู้เช่า</span>'))+'</td>'+
@@ -1927,7 +1933,7 @@ function renderRooms(root){
       const code = fd.get('code').trim();
       if(activeRooms().some(r=>r.code===code)) throw new Error('มีรหัสห้องนี้อยู่แล้ว');
       await createRoom({propertyId: fd.get('propertyId'), code, status:'VACANT', roomType:fd.get('roomType'),
-        waterMode:fd.get('waterMode'), elecMode:fd.get('elecMode'), waterFlatFee:Number(fd.get('waterFlatFee')||100),
+        waterMode:fd.get('waterMode'), elecMode:fd.get('elecMode'), waterFlatFee:Number(fd.get('waterFlatFee')||100), waterMinFee:Number(fd.get('waterMinFee')||0),
         rent:Number(fd.get('rent')), commonFee:Number(fd.get('commonFee')), hasWater:true, hasElec:true});
     }, bodyHtml:
       (props.length>1? '<div class="field"><label>หอพัก</label><select name="propertyId">'+targetProps.map(p=>'<option value="'+p.id+'">'+escapeHtml(p.name)+'</option>').join('')+'</select></div>'
@@ -1936,12 +1942,14 @@ function renderRooms(root){
       '<div class="field-row"><div class="field"><label>ประเภทห้อง</label><select name="roomType"><option value="FAN">พัดลม</option><option value="AC">แอร์</option></select></div>'+
       '<div class="field"><label>ค่าไฟฟ้า</label><select name="elecMode" id="addRoomElecMode">'+Object.entries(ELEC_MODE_LABEL).map(([v,l])=>'<option value="'+v+'">'+l+'</option>').join('')+'</select></div></div>'+
       '<div class="field-row"><div class="field"><label>ค่าน้ำประปา</label><select name="waterMode" id="addRoomWaterMode">'+Object.entries(WATER_MODE_LABEL).map(([v,l])=>'<option value="'+v+'">'+l+'</option>').join('')+'</select></div>'+
-      '<div class="field" id="addRoomWaterFlatField" style="display:none;"><label>ค่าน้ำเหมาจ่าย/เดือน (บาท)</label><input name="waterFlatFee" type="number" min="0" value="100"></div></div>'+
+      '<div class="field" id="addRoomWaterFlatField" style="display:none;"><label>ค่าน้ำเหมาจ่าย/เดือน (บาท)</label><input name="waterFlatFee" type="number" min="0" value="100"></div>'+
+      '<div class="field" id="addRoomWaterMinField"><label>ค่าน้ำขั้นต่ำ/เดือน (บาท)</label><input name="waterMinFee" type="number" min="0" value="0"><p class="hint">ใส่ 100 = เหมา 100 บาทสำหรับ 4 หน่วยแรก ใช้เกินค่อยคิดเพิ่มตามจริง ใช้ไม่ถึงคิด 100 · ใส่ 0 = ไม่มีขั้นต่ำ</p></div></div>'+
       '<div class="field-row"><div class="field"><label>ค่าเช่าต่อเดือน (บาท)</label><input name="rent" type="number" min="0" required value="3200"></div>'+
       '<div class="field"><label>ค่าส่วนกลาง/เดือน (บาท)</label><input name="commonFee" type="number" min="0" value="'+(cache.config.defaultCommonFee||0)+'"></div></div>'});
     const waterModeSel = $('#addRoomWaterMode', modalEl);
     const waterFlatField = $('#addRoomWaterFlatField', modalEl);
-    function syncWaterFlat(){ waterFlatField.style.display = waterModeSel.value==='FLAT' ? '' : 'none'; }
+    const waterMinField = $('#addRoomWaterMinField', modalEl);
+    function syncWaterFlat(){ waterFlatField.style.display = waterModeSel.value==='FLAT' ? '' : 'none'; if(waterMinField) waterMinField.style.display = waterModeSel.value==='SEPARATE' ? '' : 'none'; }
     if(waterModeSel){ waterModeSel.addEventListener('change', syncWaterFlat); syncWaterFlat(); }
   });
 }
@@ -2046,7 +2054,7 @@ function openEditRoomModal(room){
     if(newPropertyId && newPropertyId!==room.propertyId && lease) throw new Error('ย้ายหอพักไม่ได้ — ห้องนี้มีสัญญาผู้เช่าที่ใช้งานอยู่ กรุณาสิ้นสุดสัญญาก่อน');
     const prop = propertyById(newPropertyId);
     await updateRoom(room, {code, propertyId:newPropertyId, roomType:fd.get('roomType'),
-      waterMode:fd.get('waterMode'), elecMode:fd.get('elecMode'), waterFlatFee:Number(fd.get('waterFlatFee')||100),
+      waterMode:fd.get('waterMode'), elecMode:fd.get('elecMode'), waterFlatFee:Number(fd.get('waterFlatFee')||100), waterMinFee:Number(fd.get('waterMinFee')||0),
       rent:Number(fd.get('rent')), commonFee:Number(fd.get('commonFee'))});
   }, bodyHtml:
     (props.length>1? '<div class="field"><label>หอพัก</label><select name="propertyId" '+(lease?'disabled':'')+'>'+
@@ -2060,13 +2068,15 @@ function openEditRoomModal(room){
       Object.entries(ELEC_MODE_LABEL).map(([v,l])=>'<option value="'+v+'" '+(v===roomElecMode(room)?'selected':'')+'>'+l+'</option>').join('')+'</select></div></div>'+
     '<div class="field-row"><div class="field"><label>ค่าน้ำประปา</label><select name="waterMode" id="editRoomWaterMode">'+
       Object.entries(WATER_MODE_LABEL).map(([v,l])=>'<option value="'+v+'" '+(v===roomWaterMode(room)?'selected':'')+'>'+l+'</option>').join('')+'</select></div>'+
-    '<div class="field" id="editRoomWaterFlatField" style="display:none;"><label>ค่าน้ำเหมาจ่าย/เดือน (บาท)</label><input name="waterFlatFee" type="number" min="0" value="'+roomWaterFlatFee(room)+'"></div></div>'+
+    '<div class="field" id="editRoomWaterFlatField" style="display:none;"><label>ค่าน้ำเหมาจ่าย/เดือน (บาท)</label><input name="waterFlatFee" type="number" min="0" value="'+roomWaterFlatFee(room)+'"></div>'+
+    '<div class="field" id="editRoomWaterMinField"><label>ค่าน้ำขั้นต่ำ/เดือน (บาท)</label><input name="waterMinFee" type="number" min="0" value="'+roomWaterMinFee(room)+'"><p class="hint">ใส่ 100 = เหมา 100 บาทสำหรับ 4 หน่วยแรก ใช้เกินค่อยคิดเพิ่มตามจริง ใช้ไม่ถึงคิด 100 · ใส่ 0 = ไม่มีขั้นต่ำ</p></div></div>'+
     '<div class="field-row"><div class="field"><label>ค่าเช่าต่อเดือน (บาท)</label><input name="rent" type="number" min="0" required value="'+room.rent+'"></div>'+
     '<div class="field"><label>ค่าส่วนกลาง/เดือน (บาท)</label><input name="commonFee" type="number" min="0" value="'+(room.commonFee||0)+'"></div></div>'+
     '<p class="hint">การแก้ไขค่าเช่า/ค่าส่วนกลางที่นี่มีผลกับใบแจ้งหนี้งวดถัดไปเท่านั้น ไม่กระทบใบแจ้งหนี้ที่ออกไปแล้ว</p>'});
   const waterModeSel2 = $('#editRoomWaterMode', modalEl);
   const waterFlatField2 = $('#editRoomWaterFlatField', modalEl);
-  function syncWaterFlat2(){ waterFlatField2.style.display = waterModeSel2.value==='FLAT' ? '' : 'none'; }
+  const waterMinField2 = $('#editRoomWaterMinField', modalEl);
+  function syncWaterFlat2(){ waterFlatField2.style.display = waterModeSel2.value==='FLAT' ? '' : 'none'; if(waterMinField2) waterMinField2.style.display = waterModeSel2.value==='SEPARATE' ? '' : 'none'; }
   if(waterModeSel2){ waterModeSel2.addEventListener('change', syncWaterFlat2); syncWaterFlat2(); }
 }
 
@@ -2158,7 +2168,11 @@ function renderBookings(root){
 /* ============================================================
    VIEW: METER READINGS
    ============================================================ */
-let meterPeriodSel = currentPeriod();
+/* Meter month = the month whose end-of-month readings are billed WITH THE NEXT month's rent (Oct readings -> Nov bill).
+   Default to the reading month that the bill being prepared now needs (on 1 Nov, or 31 Oct: October). */
+function meterDefaultPeriod(){ return prevPeriod(billPeriodNow()); }
+function meterBillLabel(p){ return 'มิเตอร์เดือน '+periodLabel(p)+' → ใช้ออกบิลค่าเช่าเดือน '+periodLabel(nextPeriod(p)); }
+let meterPeriodSel = meterDefaultPeriod();
 
 /* ---- Excel template / upload for monthly meter readings ---- */
 function loadXLSX(){
@@ -2193,7 +2207,7 @@ async function downloadMeterTemplate(){
   const ws = X.utils.aoa_to_sheet(rows);
   ws['!cols'] = [{wch:12},{wch:8},{wch:22},{wch:22},{wch:22},{wch:22}];
   const guide = X.utils.aoa_to_sheet([
-    ['วิธีใช้เทมเพลตมิเตอร์ — งวด '+periodLabel(period)],
+    ['วิธีใช้เทมเพลตมิเตอร์ — '+meterBillLabel(period)],
     ['1) กรอกเลขมิเตอร์ปัจจุบันในคอลัมน์ "มิเตอร์น้ำ (ปัจจุบัน)" และ "มิเตอร์ไฟ (ปัจจุบัน)" (ห้องที่ไม่มีมิเตอร์/ไม่คิดเงินปล่อยว่างได้)'],
     ['2) ห้ามเปลี่ยนชื่อคอลัมน์และรหัสห้อง ใช้ตัวเลขล้วน ทศนิยมได้'],
     ['3) ห้องว่างและห้องปิดซ่อมก็ต้องกรอก เพื่อใช้ตรวจสอบการใช้น้ำ-ไฟในห้องว่าง'],
@@ -2267,6 +2281,8 @@ function buildMeterImportPlan(parsed, period){
       it.usage = Math.round((v-it.prev)*100)/100;
       if(ex && ex.value===v){ it.level='skip'; it.note='เท่ากับที่บันทึกไว้แล้ว'; return; }
       if(ex) { it.level='warn'; it.note='จะเขียนทับค่าเดิม '+ex.value; }
+      if(it.prev===0 && v>0){ it.level='warn'; it.note=(it.note?it.note+' · ':'')+'ค่าก่อนหน้าเป็น 0 แต่ค่าใหม่ '+v+' — จะคิดว่าใช้ '+it.usage+' หน่วย ตรวจสอบก่อน'; }
+      else if((type==='water' && it.usage>60) || (type==='elec' && it.usage>800)){ it.level='warn'; it.note=(it.note?it.note+' · ':'')+'ใช้สูงมาก ('+it.usage+' หน่วย) — ตรวจสอบ'; }
       if(room.status!=='OCCUPIED' && it.usage > (cfg.vacantUsageThreshold||3)){ it.level='warn'; it.note=(it.note?it.note+' · ':'')+'ห้อง'+(room.status==='VACANT'?'ว่าง':'ไม่มีผู้เช่า')+'แต่ใช้ '+it.usage+' หน่วย — ตรวจสอบ'; }
       const hist = cache.meterReadings.filter(r=>r.roomId===room.id && r.type===type && r.period<period && !r.baseline).sort((a,b)=>a.period<b.period?1:-1)[0];
       if(hist && hist.usage>0 && room.status==='OCCUPIED' && Math.abs(it.usage-hist.usage)/hist.usage*100 > (cfg.anomalyPercent||50)){ it.level='warn'; it.note=(it.note?it.note+' · ':'')+'ผิดปกติจากเดือนก่อน ('+hist.usage+' → '+it.usage+')'; }
@@ -2277,11 +2293,13 @@ function buildMeterImportPlan(parsed, period){
   sortedRoomsForSheet().forEach(r=>['water','elec'].forEach(t=>{
     if(meterRequired(r,t) && !readingFor(r.id,t,period) && !touched.has(r.id+'|'+t)) missing.push(r.code+(t==='water'?' (น้ำ)':' (ไฟ)'));
   }));
-  return {items, missing};
+  const valid = items.filter(i=>i.room && i.prev!=null && i.usage!=null);
+  const same = valid.filter(i=>i.usage===0);
+  return {items, missing, validN:valid.length, sameN:same.length, sameWarn: valid.length>=10 && same.length/valid.length>=0.8};
 }
 function openMeterUploadModal(){
   const period = meterPeriodSel; let plan = null;
-  const back = openModal({title:'อัปโหลด Excel มิเตอร์ — งวด '+periodLabel(period), wide:true, submitLabel:'นำเข้า', onSubmit: async ()=>{
+  const back = openModal({title:'อัปโหลด Excel มิเตอร์ — '+meterBillLabel(period), wide:true, submitLabel:'นำเข้า', onSubmit: async ()=>{
     if(!plan) throw new Error('เลือกไฟล์ Excel ก่อน');
     const todo = plan.items.filter(i=>i.level==='ok'||i.level==='warn');
     if(!todo.length) throw new Error('ไม่มีรายการที่นำเข้าได้');
@@ -2293,6 +2311,7 @@ function openMeterUploadModal(){
     await logAudit({action:'IMPORT_METER_EXCEL', entityType:'meterReading', entityId:'', newValue:{period, imported:ok, failed:fail.length}});
     toast('นำเข้ามิเตอร์ '+ok+' รายการ'+(fail.length?' · ไม่สำเร็จ '+fail.length+' ('+fail[0]+')':''), fail.length?'warn':'ok');
   }, bodyHtml:
+    '<div class="help-box" style="background:var(--warn-soft,var(--surface-2));"><strong>ไฟล์นี้คือค่ามิเตอร์ปลายเดือน '+periodLabel(period)+'</strong> — ใช้คิดค่าน้ำ-ไฟในใบแจ้งหนี้ค่าเช่าเดือน '+periodLabel(nextPeriod(period))+' ถ้าไฟล์เป็นของเดือนอื่น ให้ปิดหน้านี้แล้วเลือกเดือนจากรายการด้านบนก่อน</div>'+
     '<div class="help-box">เลือกไฟล์ตามเทมเพลต (ดาวน์โหลดได้ที่ปุ่ม "ดาวน์โหลดเทมเพลต Excel") ระบบจะแสดงตัวอย่างและตรวจความผิดปกติก่อน ยังไม่บันทึกจนกว่าจะกด "นำเข้า" · ค่าที่นำเข้าจะอยู่สถานะ "รอตรวจสอบ" ให้ ADMIN/OWNER ยืนยัน และไม่มีรูปถ่ายแนบ</div>'+
     '<div class="field"><label>ไฟล์ Excel (.xlsx / .xls / .csv)</label><input type="file" id="mtFile" accept=".xlsx,.xls,.csv"></div><div id="mtPrev"></div>'});
   const submit = $('button[type=submit]', back); submit.disabled = true;
@@ -2311,19 +2330,22 @@ function openMeterUploadModal(){
       const shown = plan.items.slice().sort((a,b)=>({err:0,warn:1,ok:2,skip:3}[a.level]-{err:0,warn:1,ok:2,skip:3}[b.level]));
       box.innerHTML =
         '<p style="margin:8px 0;"><strong>นำเข้าได้ '+importable+' รายการ</strong>'+(cnt('warn')?' (ต้องตรวจ '+cnt('warn')+')':'')+(cnt('err')?' · <span style="color:var(--danger);">มีปัญหา '+cnt('err')+'</span>':'')+(cnt('skip')?' · ข้าม '+cnt('skip'):'')+'</p>'+
+        (plan.sameWarn ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);"><strong>ระวังเลือกเดือนผิด:</strong> '+plan.sameN+' จาก '+plan.validN+' จุดมีค่าเท่ากับเดือนก่อนหน้า (ใช้ 0 หน่วย) — ถ้าไฟล์นี้เป็นค่าปลายเดือน '+periodLabel(prevPeriod(period))+' ที่นำเข้าไว้แล้ว ให้ปิดหน้านี้แล้วเลือกเดือน '+periodLabel(prevPeriod(period))+' ไม่ใช่ '+periodLabel(period)+
+          '<div style="margin-top:6px;"><label style="display:inline-flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" id="mtSameOk"> ยืนยันว่าเลือกเดือน '+periodLabel(period)+' ถูกต้อง</label></div></div>' : '')+
         (plan.missing.length ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);">ยังไม่มีค่าในไฟล์/ระบบ '+plan.missing.length+' จุด: '+plan.missing.slice(0,15).join(', ')+(plan.missing.length>15?' …':'')+'</div>' : '')+
         (parsed.notes.length ? '<p class="hint">'+parsed.notes.map(escapeHtml).join(' · ')+'</p>' : '')+
         '<div class="tbl-wrap" style="max-height:340px;overflow:auto;"><table class="grid"><thead><tr><th>ห้อง</th><th>มิเตอร์</th><th>ก่อนหน้า</th><th>ใหม่</th><th>ใช้ไป</th><th>ผลตรวจ</th></tr></thead><tbody>'+
         shown.map(i=>'<tr><td><b>'+escapeHtml(i.code)+'</b></td><td>'+METER_TYPE_LABEL[i.type]+'</td><td class="num">'+(i.prev==null?'-':i.prev)+'</td><td class="num">'+(Number.isNaN(i.value)?'-':i.value)+'</td><td class="num">'+(i.usage==null?'-':i.usage)+'</td><td>'+pill[i.level]+' <span style="font-size:12px;color:var(--text-muted);">'+escapeHtml(i.note)+'</span></td></tr>').join('')+
         '</tbody></table></div>';
-      submit.disabled = importable===0; submit.textContent = 'นำเข้า '+importable+' รายการ';
+      submit.disabled = importable===0 || !!plan.sameWarn; submit.textContent = 'นำเข้า '+importable+' รายการ';
+      const sok = $('#mtSameOk', back); if(sok) sok.addEventListener('change', ()=>{ submit.disabled = importable===0 || !sok.checked; });
     }catch(err){ box.innerHTML = '<p style="color:var(--danger);font-size:13px;">'+escapeHtml(err.message)+'</p>'; }
   });
 }
 
 function renderMeters(root){
   const periods = pastPeriods(currentPeriod(), 6);
-  if(!periods.includes(meterPeriodSel)) meterPeriodSel = currentPeriod();
+  if(!periods.includes(meterPeriodSel)) meterPeriodSel = meterDefaultPeriod();
   const props = activeProperties();
   if(selectedPropertyId!=='ALL' && !props.some(p=>p.id===selectedPropertyId)) selectedPropertyId='ALL';
   root.innerHTML =
@@ -2331,7 +2353,7 @@ function renderMeters(root){
       '<div class="tag-row">'+
       (props.length>1? '<select id="meterPropSel" class="btn sm"><option value="ALL" '+(selectedPropertyId==='ALL'?'selected':'')+'>ทุกหอพัก</option>'+
         props.map(p=>'<option value="'+p.id+'" '+(p.id===selectedPropertyId?'selected':'')+'>'+escapeHtml(p.name)+' ('+p.code+')</option>').join('')+'</select>' : '')+
-      '<select id="periodSel" class="btn sm">'+periods.slice().reverse().map(p=>'<option value="'+p+'" '+(p===meterPeriodSel?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select>'+
+      '<select id="periodSel" class="btn sm">'+periods.slice().reverse().map(p=>'<option value="'+p+'" '+(p===meterPeriodSel?'selected':'')+'>'+periodLabel(p)+' → บิล '+periodLabel(nextPeriod(p))+'</option>').join('')+'</select>'+
       (can('RECORD_METER') ? '<button class="btn sm" id="mtTplBtn">'+icon('invoice')+' ดาวน์โหลดเทมเพลต Excel</button><button class="btn sm primary" id="mtUpBtn">'+icon('plus')+' อัปโหลด Excel</button>' : '')+
       '</div></div>'+
     '<div class="help-box">ต้นรอบบิลของทุกงวด ต้องจดมิเตอร์ครบทุกห้องที่มีมิเตอร์ ไม่ว่าห้องจะว่างหรือปิดซ่อมบำรุงก็ตาม เพื่อให้ตรวจสอบย้อนกลับได้เสมอ</div>'+
@@ -2404,7 +2426,7 @@ function renderMetersBody(){
   if(sumEl){
     const names = allRooms.filter(r=>missByRoom.has(r.id)).map(r=>r.code+' ('+missByRoom.get(r.id).join('/')+')');
     sumEl.innerHTML = '<div class="help-box" style="'+(missN? 'background:var(--danger-soft);border-color:var(--danger);':'')+'">'+
-      '<strong>งวด '+periodLabel(meterPeriodSel)+'</strong> · จดแล้ว <strong>'+doneN+'/'+reqN+'</strong> จุด'+
+      '<strong>'+meterBillLabel(meterPeriodSel)+'</strong> · จดแล้ว <strong>'+doneN+'/'+reqN+'</strong> จุด'+
       (missN? ' · <strong style="color:var(--danger);">ยังไม่จด '+missN+' จุด</strong>: '+names.slice(0,12).join(', ')+(names.length>12?' และอีก '+(names.length-12)+' ห้อง':'') : ' · ครบทุกห้องแล้ว')+
       (missN? '<div style="margin-top:6px;"><label style="display:inline-flex;gap:6px;align-items:center;cursor:pointer;"><input type="checkbox" id="onlyMissing" '+(meterOnlyMissing?'checked':'')+'> แสดงเฉพาะห้องที่ยังไม่จด</label></div>':'')+
       '</div>';
@@ -2562,7 +2584,7 @@ function renderInvoices(root){
       (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+
       (i.status==='cancelled' && i.lineBillSentAt ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineCancelNotifiedAt ? 'แจ้งยกเลิกเข้ากลุ่มแล้ว '+fmtDateTime(i.lineCancelNotifiedAt) : 'ยังไม่ได้แจ้งยกเลิกเข้ากลุ่ม')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
       '<td class="num">'+money(i.rentAmount)+(i.prepayMonths>1?'<div class="footnote">ล่วงหน้า '+i.prepayMonths+' เดือน ถึง '+periodLabel(i.prepayTo)+'</div>':'')+(i.prepaidBy?'<div class="footnote">ชำระล่วงหน้าแล้ว'+(i.prepaidByNumber?' ('+escapeHtml(i.prepaidByNumber)+')':'')+'</div>':'')+'</td>'+
-      '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':'')))+'</td>'+
+      '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':(i.waterMinApplied?' <span class="pill muted" style="padding:1px 6px;" title="ใช้น้ำไม่ถึงหน่วยที่รวมในค่าขั้นต่ำ — คิดขั้นต่ำ">ขั้นต่ำ</span>':''))))+'</td>'+
       '<td class="num">'+(elecInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':money(i.elecAmount))+'</td>'+
       '<td class="num">'+money(i.commonFee||0)+'</td>'+
       '<td class="num">'+(i.discount>0?'-'+money(i.discount):'-')+'</td><td class="num"><strong>'+money(i.total)+'</strong></td>'+
@@ -2721,7 +2743,7 @@ const lm = n=>{ n=Number(n||0); return Number.isInteger(n) ? n.toLocaleString('e
 function invoiceBreakdown(i){
   const wMode = i.waterMode||i.billingMode, eMode = i.elecMode||i.billingMode;
   const parts = [i.prepaidBy ? 'ค่าเช่า ชำระล่วงหน้าแล้ว' : (i.prepayMonths>1 ? 'เช่า '+i.prepayMonths+' เดือน ('+periodLabel(i.period)+' – '+periodLabel(i.prepayTo)+') '+lm(i.rentAmount) : 'เช่า '+lm(i.rentAmount))];
-  if(wMode!=='INCLUSIVE') parts.push('น้ำ '+lm(i.waterAmount)+(i.waterMode==='FLAT'?' (เหมา)':(i.waterUnits? ' ('+i.waterUnits+' หน่วย)':'')));
+  if(wMode!=='INCLUSIVE') parts.push('น้ำ '+lm(i.waterAmount)+(i.waterMode==='FLAT'?' (เหมา)':(i.waterUnits||i.waterMinApplied? ' ('+(i.waterUnits||0)+' หน่วย'+(i.waterMinApplied?' · คิดขั้นต่ำ '+lm(i.waterMinFee)+' บาท':'')+')':'')));
   if(eMode!=='INCLUSIVE') parts.push('ไฟ '+lm(i.elecAmount)+(i.elecUnits? ' ('+i.elecUnits+' หน่วย)':''));
   if(Number(i.commonFee||0)>0) parts.push('ส่วนกลาง '+lm(i.commonFee));
   if(Number(i.discount||0)>0) parts.push('ส่วนลด -'+lm(i.discount));
