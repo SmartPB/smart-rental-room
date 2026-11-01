@@ -3001,11 +3001,19 @@ function openInvoiceModal(){
   const eligible = scopedRooms().filter(r=>activeLeaseFor(r.id));
   if(!eligible.length){ toast('ยังไม่มีห้องที่มีสัญญาผู้เช่าที่ใช้งานอยู่ในขอบเขตที่เลือก','err'); return; }
   const periods = pastPeriods(nextPeriod(billPeriodNow()),4);
-  openModal({title:'ออกใบแจ้งหนี้', onSubmit: async fd=>{
+  // rooms that already have a (non-cancelled) invoice for the chosen period are not offered again; sorted by room code (A-Z, 1-9)
+  const roomOptionsFor = period=>{
+    const done = new Set(cache.invoices.filter(i=>i.period===period && i.status!=='cancelled').map(i=>i.roomId));
+    const list = eligible.filter(r=>!done.has(r.id)).sort((a,b)=>String(a.code).localeCompare(String(b.code),'en',{numeric:true}));
+    if(!list.length) return '<option value="">ออกใบแจ้งหนี้งวดนี้ครบทุกห้องแล้ว</option>';
+    return list.map(r=>'<option value="'+r.id+'">'+r.code+' — '+activeLeaseFor(r.id).tenantName+' (น้ำ:'+WATER_MODE_LABEL[roomWaterMode(r)]+' / ไฟ:'+ELEC_MODE_LABEL[roomElecMode(r)]+')</option>').join('');
+  };
+  const defPeriod = billPeriodNow();
+  const modal = openModal({title:'ออกใบแจ้งหนี้', onSubmit: async fd=>{
     const roomId = fd.get('roomId'); const room = roomById(roomId);
     await generateInvoice({roomId, roomCode:room.code, period:fd.get('period'), discount:fd.get('discount'), discountReason:fd.get('discountReason'), prepayMonths:fd.get('prepayMonths')});
   }, bodyHtml:
-    '<div class="field"><label>ห้อง</label><select name="roomId" required>'+eligible.map(r=>'<option value="'+r.id+'">'+r.code+' — '+activeLeaseFor(r.id).tenantName+' (น้ำ:'+WATER_MODE_LABEL[roomWaterMode(r)]+' / ไฟ:'+ELEC_MODE_LABEL[roomElecMode(r)]+')</option>').join('')+'</select></div>'+
+    '<div class="field"><label>ห้อง</label><select name="roomId" required>'+roomOptionsFor(defPeriod)+'</select></div>'+
     '<div class="field"><label>งวดบิล</label><select name="period" required>'+periods.slice().reverse().map(p=>'<option value="'+p+'" '+(p===billPeriodNow()?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select>'+
     '<p class="hint">ใบแจ้งหนี้เป็นค่าเช่าของเดือนที่เลือก ส่วนค่าน้ำ-ไฟคิดจากมิเตอร์ที่จดปลายเดือนก่อนหน้า (เช่น ค่าเช่า พ.ย. ใช้มิเตอร์ที่จด ต.ค.) · ระบบจะดึงค่าเช่าและค่าส่วนกลางจากห้อง และคำนวณค่าน้ำ-ไฟจากมิเตอร์โดยอัตโนมัติ (ห้ามคิดค่าน้ำ-ไฟแยกถ้าห้องตั้งเป็น “รวมในค่าเช่า”)</p></div>'+
     '<div class="field-row"><div class="field"><label>ส่วนลด (บาท, ถ้ามี)</label><input name="discount" type="number" min="0" value="0"></div>'+
@@ -3013,6 +3021,8 @@ function openInvoiceModal(){
       '<p class="hint">ลูกค้าที่จ่ายล่วงหน้า: ค่าเช่าและค่าส่วนกลางคูณจำนวนเดือน รวมในใบเดียว ค่าน้ำ-ไฟคิดเฉพาะเดือนแรก เดือนถัดไประบบออกบิลเฉพาะค่าน้ำ-ไฟเมื่อจดมิเตอร์ (ค่าเช่าแสดงว่าชำระแล้ว) · ส่วนลดใส่ในช่องด้านล่าง</p></div>'+
     '<div class="field"><label>เหตุผลส่วนลด</label><input name="discountReason" placeholder="ไม่บังคับถ้าไม่มีส่วนลด"></div></div>'+
     '<div class="help-box">ส่วนลดเกิน '+(cache.config.discountApprovalThreshold||100)+' บาท ต้องผ่านการอนุมัติจากเจ้าของกิจการ ส่วนลดของพนักงานทุกจำนวนต้องผ่านผู้ดูแลระบบขึ้นไปก่อนเสมอ</div>'});
+  const roomSel = $('select[name=roomId]', modal), perSel = $('select[name=period]', modal);
+  perSel.addEventListener('change', ()=>{ roomSel.innerHTML = roomOptionsFor(perSel.value); });
 }
 function openPaymentModal(invoice){
   const paid = cache.payments.filter(p=>p.invoiceId===invoice.id && p.status==='active').reduce((s,p)=>s+p.amount,0);
