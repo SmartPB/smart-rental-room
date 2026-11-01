@@ -490,6 +490,51 @@ async function lineCall(action, payload){
   return j;
 }
 
+/* LINE cannot unsend a message the bot already pushed — "cancelling a send" = an automatic follow-up notice in the same room group */
+/* Every message that goes to a LINE group is shown first (exact text) and only sent after a second, explicit confirmation */
+/* Preview/dry-run flags only exist on server v5+. An older km-line would IGNORE them and really send / approve, so check first. */
+async function lineCallPreview(action, payload){
+  const st = await lineCall('status');
+  if(!(Number(st.ver)>=5)) throw new Error('ฝั่งเซิร์ฟเวอร์ (km-line) ยังเป็นเวอร์ชันเก่า ยังไม่รองรับการดูข้อความก่อนส่ง — ยังไม่ได้ส่งอะไรเข้ากลุ่ม ต้อง deploy เวอร์ชันใหม่ก่อน');
+  return lineCall(action, payload);
+}
+function openSendPreview({title, items, confirmLabel, note, onConfirm, onBack}){
+  const body = '<div class="help-box"><b>ตรวจข้อความด้านล่างให้ถูกต้องก่อนกดยืนยัน</b> — ข้อความจะถูกส่งเข้ากลุ่มไลน์ตามนี้ทุกตัวอักษร และ LINE ลบข้อความที่ส่งไปแล้วไม่ได้'+(note?'<br>'+note:'')+'</div>'+
+    '<div id="pvList" style="max-height:52vh;overflow:auto;">'+items.map((it,k)=>
+      '<div class="field" style="margin-bottom:10px;"><label>'+escapeHtml(it.label)+(it.warn?' <span class="pill bad" style="padding:1px 6px;">'+escapeHtml(it.warn)+'</span>':'')+'</label>'+
+      '<textarea readonly style="width:100%;min-height:'+Math.min(300, 40+ (String(it.text).split('\n').length*20))+'px;font-family:inherit;'+(it.warn?'opacity:.55;':'')+'">'+escapeHtml(it.text)+'</textarea></div>').join('')+'</div>'+
+    (onBack ? '<button type="button" class="btn sm" id="pvBack">‹ ย้อนกลับไปแก้ไข</button>' : '');
+  const back = openModal({title, wide:true, submitLabel: confirmLabel||'ยืนยันและส่งข้อความนี้', onSubmit: async ()=>{ await onConfirm(); }, bodyHtml: body});
+  const bb = $('#pvBack', back); if(bb) bb.addEventListener('click', ()=>{ back.remove(); onBack(); });
+  return back;
+}
+const CANCEL_KIND_LABEL = {invoice:'ใบแจ้งหนี้', payment:'ใบเสร็จรับเงิน', moveout:'สรุปเงินมัดจำ'};
+async function notifyCancelLine(kind, id){
+  if(!(role()==='ADMIN' || role()==='OWNER')) return {sent:false, reason:'role'};
+  try{
+    const r = await lineCall('notify_cancel', {kind, id});
+    if(r.sent) toast('ส่งแจ้งยกเลิก'+CANCEL_KIND_LABEL[kind]+'เข้ากลุ่มไลน์ห้องแล้ว','ok');
+    return r;
+  }catch(e){
+    toast('ยกเลิกในระบบแล้ว แต่ส่งแจ้งยกเลิกเข้ากลุ่มไลน์ไม่สำเร็จ: '+e.message+' — กดปุ่ม "ส่งแจ้งยกเลิกเข้ากลุ่ม" ที่รายการเพื่อลองใหม่ หรือแจ้งลูกค้าเอง','err');
+    return {sent:false, error:e.message};
+  }
+}
+function wireCancelNoticeButtons(root){
+  $all('[data-cancelnotice]', root).forEach(b=>b.addEventListener('click', async ()=>{
+    b.disabled = true;
+    const kind = b.dataset.ckind, id = b.dataset.cancelnotice;
+    try{
+      const r = await lineCallPreview('notify_cancel', {kind, id, dry:true});
+      if(r.reason==='never-sent') toast('รายการนี้ไม่เคยส่งเข้ากลุ่มไลน์ ไม่ต้องแจ้งยกเลิก');
+      else if(r.reason==='already') toast('แจ้งยกเลิกเข้ากลุ่มไปแล้ว');
+      else openSendPreview({title:'แจ้งยกเลิก'+CANCEL_KIND_LABEL[kind]+'เข้ากลุ่มไลน์ห้อง', items:[{label:'ข้อความที่จะส่ง', text:r.text}], confirmLabel:'ยืนยันส่งแจ้งยกเลิก',
+        onConfirm: async ()=>{ await notifyCancelLine(kind, id); }});
+    }catch(e){ toast(e.message,'err'); }
+    b.disabled = false;
+  }));
+}
+
 /* ============================================================
    CACHE — subscribed collections kept in memory for fast render
    ============================================================ */
@@ -937,20 +982,25 @@ async function reissueInvoice(oldInvoice){
   const room = roomById(oldInvoice.roomId);
   const prop = propertyById(oldInvoice.propertyId);
   const invSeq = await nextInvoiceSeq(oldInvoice.propertyId, prop.code, oldInvoice.period);
+  // a re-issued bill takes today's contract rent and common fee (the usual reason for re-issuing is a wrong amount); meter-based water/electric stay as billed
+  const leaseNow = activeLeaseFor(oldInvoice.roomId);
+  const nMonths = oldInvoice.prepayMonths>1 ? oldInvoice.prepayMonths : 1;
+  const rentNew = oldInvoice.prepaidBy ? 0 : r2(Number(leaseNow ? leaseNow.rent : (room ? room.rent : oldInvoice.rentAmount)) * nMonths);
+  const commonNew = oldInvoice.prepaidBy ? 0 : r2(Number(room ? (room.commonFee||0) : (oldInvoice.commonFee||0)) * nMonths);
   const newId = await Store.add('invoices', {
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: oldInvoice.propertyId, propertyCode: prop.code,
     roomId: oldInvoice.roomId, roomCode: oldInvoice.roomCode, period: oldInvoice.period, waterMode: oldInvoice.waterMode, elecMode: oldInvoice.elecMode,
     prepayMonths: oldInvoice.prepayMonths||0, prepayTo: oldInvoice.prepayTo||'', prepaidBy: oldInvoice.prepaidBy||'', prepaidByNumber: oldInvoice.prepaidByNumber||'',
-    rentAmount: oldInvoice.rentAmount, waterUnits: oldInvoice.waterUnits, waterAmount: oldInvoice.waterAmount,
-    elecUnits: oldInvoice.elecUnits, elecAmount: oldInvoice.elecAmount, commonFee: oldInvoice.commonFee,
+    rentAmount: rentNew, waterUnits: oldInvoice.waterUnits, waterAmount: oldInvoice.waterAmount,
+    elecUnits: oldInvoice.elecUnits, elecAmount: oldInvoice.elecAmount, commonFee: commonNew,
     discount:0, discountReason:'', discountState:'none', discountApprovedBy:'',
-    total: oldInvoice.rentAmount+oldInvoice.waterAmount+oldInvoice.elecAmount+oldInvoice.commonFee,
+    total: rentNew+oldInvoice.waterAmount+oldInvoice.elecAmount+commonNew,
     status:'unpaid', createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
     replacesInvoiceId: oldInvoice.id, replacedByInvoiceId:''
   });
   await Store.update('invoices', oldInvoice.id, {replacedByInvoiceId:newId});
   await logAudit({action:'REISSUE_INVOICE', entityType:'invoice', entityId:newId, oldValue:{replaces:oldInvoice.invoiceNumber}, newValue:{invoiceNumber:invSeq.label}});
-  toast('ออกใบแจ้งหนี้ใหม่ '+invSeq.label+' แทนใบเดิม '+oldInvoice.invoiceNumber+' แล้ว','ok');
+  toast('ออกใบแจ้งหนี้ใหม่ '+invSeq.label+' แทนใบเดิม '+oldInvoice.invoiceNumber+' แล้ว (ค่าเช่า '+money(rentNew)+' บาท)'+(rentNew!==oldInvoice.rentAmount?' — เปลี่ยนจากใบเดิม '+money(oldInvoice.rentAmount):''),'ok');
 }
 
 /* ---- payments / receipts ---- */
@@ -1015,6 +1065,7 @@ async function resolveApproval(appr, decision /* 'APPROVED'|'REJECTED' */){
   }
   await logAudit({action:'RESOLVE_APPROVAL_'+decision, entityType:'approval', entityId:appr.id, newValue:{type:appr.type, entityId:appr.entityId, selfResolved:isSelf}});
   toast((decision==='APPROVED'?'อนุมัติ':'ยกเลิก')+'คำขอ: '+APPROVAL_TYPE_LABEL[appr.type], decision==='APPROVED'?'ok':undefined);
+  if(decision==='APPROVED' && (appr.type==='INVOICE_CANCEL' || appr.type==='VOID_PAYMENT')) await notifyCancelLine(appr.type==='INVOICE_CANCEL'?'invoice':'payment', appr.entityId);
 }
 async function applyApprovalEffect(appr){
   if(appr.type==='VOID_PAYMENT'){
@@ -1830,7 +1881,7 @@ function renderRooms(root){
       '<td>'+statusPill(r.status)+'</td>'+
       '<td>'+(lease? escapeHtml(lease.tenantName) : (r.status==='RESERVED'? '<span class="pill info">มีผู้จองแล้ว</span>' : '<span class="pill muted">ไม่มีผู้เช่า</span>'))+'</td>'+
       '<td style="white-space:nowrap;">'+(lease? leaseDurationLabel(lease)+'<div class="footnote">ตั้งแต่ '+fmtDate(lease.startDate)+'</div>'+(lease.termMonths? (()=>{ const ti = leaseTermInfo(lease.startDate, lease.termMonths); return '<div class="footnote">สัญญา '+lease.termMonths+' เดือน · ครบ '+fmtDate(ti.end)+(ti.renewals? ' (ต่อสัญญาแล้ว '+ti.renewals+' ครั้ง)':'')+'</div>'; })(): '<div class="footnote">ยังไม่ระบุอายุสัญญา</div>') : '-')+'</td>'+
-      '<td class="num">'+money(r.rent)+'</td>'+
+      '<td class="num">'+(lease && Number(lease.rent)!==Number(r.rent) ? money(lease.rent)+'<div class="footnote" title="ใบแจ้งหนี้ใช้ค่าเช่าตามสัญญาของผู้เช่า">ตามสัญญา · ราคาห้อง '+money(r.rent)+'</div>' : money(r.rent))+'</td>'+
       '<td class="num">'+money(r.commonFee||0)+'</td>'+
       '<td style="text-align:right;white-space:nowrap;">'+
         (can('MANAGE_ROOMS') && !lease && r.status==='VACANT' ? '<button class="btn sm" data-lease="'+r.id+'">+ ผูกผู้เช่า</button>' : '')+
@@ -2508,7 +2559,8 @@ function renderInvoices(root){
     const elecInclusive = (i.elecMode||i.billingMode)==='INCLUSIVE';
     const waterFlat = i.waterMode==='FLAT';
     return '<tr><td class="mono">'+(i.invoiceNumber||'-')+(i.replacesInvoiceId?'<div class="footnote">แทนใบเดิม</div>':'')+(i.moveOutId?'<div class="footnote">หักจากเงินมัดจำ (ย้ายออก)</div>':'')+
-      (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
+      (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+
+      (i.status==='cancelled' && i.lineBillSentAt ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineCancelNotifiedAt ? 'แจ้งยกเลิกเข้ากลุ่มแล้ว '+fmtDateTime(i.lineCancelNotifiedAt) : 'ยังไม่ได้แจ้งยกเลิกเข้ากลุ่ม')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
       '<td class="num">'+money(i.rentAmount)+(i.prepayMonths>1?'<div class="footnote">ล่วงหน้า '+i.prepayMonths+' เดือน ถึง '+periodLabel(i.prepayTo)+'</div>':'')+(i.prepaidBy?'<div class="footnote">ชำระล่วงหน้าแล้ว'+(i.prepaidByNumber?' ('+escapeHtml(i.prepaidByNumber)+')':'')+'</div>':'')+'</td>'+
       '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':'')))+'</td>'+
       '<td class="num">'+(elecInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':money(i.elecAmount))+'</td>'+
@@ -2519,15 +2571,17 @@ function renderInvoices(root){
         (i.status==='unpaid'||i.status==='partial' ? '<button class="btn sm primary" data-pay="'+i.id+'">รับชำระ</button>' : '')+
         (['unpaid','partial','pending_discount'].includes(i.status) ? ' <button class="btn sm" data-cancel="'+i.id+'">ขอยกเลิก</button>' : '')+
         (paid<i.total && i.status!=='cancelled' && i.status!=='waived' ? ' <button class="btn sm" data-waive="'+i.id+'">ขอยกหนี้</button>' : '')+
+        (i.status==='cancelled' && i.lineBillSentAt && !i.lineCancelNotifiedAt && can('SEND_BILLS') ? ' <button class="btn sm primary" data-cancelnotice="'+i.id+'" data-ckind="invoice">'+icon('send')+' ส่งแจ้งยกเลิกเข้ากลุ่ม</button>' : '')+
         (i.status==='cancelled' && !i.replacedByInvoiceId && can('CREATE_INVOICE') ? ' <button class="btn sm primary" data-reissue="'+i.id+'">ออกใบใหม่แทน</button>' : '')+
         (can('SEND_BILLS') && ['unpaid','partial'].includes(i.status) ? ' <button class="btn sm'+(i.lineBillSentAt?'':' primary')+'" data-sendbill="'+i.id+'" title="ตรวจสอบแล้วส่งบิลเข้ากลุ่มไลน์ของห้อง">'+icon('send')+' '+(i.lineBillSentAt?'ส่งซ้ำ':'ส่งเข้ากลุ่มห้อง')+'</button>' : '')+
       '</td></tr>';
   }).join('');
+  wireCancelNoticeButtons(body);
   $all('[data-pay]', body).forEach(b=>b.addEventListener('click', ()=>openPaymentModal(cache.invoices.find(i=>i.id===b.dataset.pay))));
   $all('[data-cancel]', body).forEach(b=>b.addEventListener('click', ()=>{
     const inv = cache.invoices.find(i=>i.id===b.dataset.cancel);
     openModal({title:'ขอยกเลิกใบแจ้งหนี้ '+inv.invoiceNumber, submitLabel:'ส่งคำขอ', onSubmit: async fd=>{ await requestInvoiceCancel(inv, fd.get('reason')); },
-      bodyHtml:'<div class="help-box">คำขอนี้ต้องได้รับอนุมัติจากเจ้าของกิจการก่อนจึงจะมีผล ใบแจ้งหนี้จะไม่ถูกลบ เพียงเปลี่ยนสถานะเป็นยกเลิก — ออกใบใหม่แทนได้หลังอนุมัติ</div><div class="field"><label>เหตุผล</label><textarea name="reason" required></textarea></div>'});
+      bodyHtml:'<div class="help-box">คำขอนี้ต้องได้รับอนุมัติจากเจ้าของกิจการก่อนจึงจะมีผล ใบแจ้งหนี้จะไม่ถูกลบ เพียงเปลี่ยนสถานะเป็นยกเลิก — ออกใบใหม่แทนได้หลังอนุมัติ</div>'+(inv.lineBillSentAt?'<div class="help-box">ใบนี้เคยส่งเข้ากลุ่มไลน์ห้องแล้ว — เมื่อเจ้าของอนุมัติ ระบบจะส่งข้อความแจ้งยกเลิกเข้ากลุ่มห้องให้อัตโนมัติ (LINE ลบข้อความที่ส่งไปแล้วไม่ได้)</div>':'')+'<div class="field"><label>เหตุผล</label><textarea name="reason" required></textarea></div>'});
   }));
   $all('[data-waive]', body).forEach(b=>b.addEventListener('click', ()=>{
     const inv = cache.invoices.find(i=>i.id===b.dataset.waive);
@@ -2580,15 +2634,28 @@ async function openSendBillsModal({period, onlyId}){
   const props = activeProperties();
   const startProp = (selectedPropertyId!=='ALL' && props.some(p=>p.id===selectedPropertyId)) ? selectedPropertyId : 'ALL';
   const state = {period: period||periods[0]||billPeriodNow(), prop: startProp, resend:false};
-  const back = openModal({title: onlyId ? 'ส่งบิลเข้ากลุ่มห้อง' : 'ตรวจสอบและส่งบิลเข้ากลุ่มห้อง', wide:true, submitLabel:'ส่งบิลที่เลือก', onSubmit: async ()=>{
+  const back = openModal({title: onlyId ? 'ส่งบิลเข้ากลุ่มห้อง' : 'ตรวจสอบและส่งบิลเข้ากลุ่มห้อง', wide:true, submitLabel:'ต่อไป: ดูข้อความที่จะส่ง', onSubmit: async ()=>{
     const ids = $all('input[data-sb]:checked', back).map(c=>c.dataset.sb);
     if(!ids.length) throw new Error('ยังไม่ได้เลือกใบแจ้งหนี้');
-    const sent=[], noGroup=[], failed=[];
-    for(let i=0;i<ids.length;i+=100){
-      const r = await lineCall('send_bills', {invoiceIds: ids.slice(i,i+100), resend: state.resend});
-      sent.push(...r.sent); noGroup.push(...r.noGroup); failed.push(...r.failed);
-    }
-    toast('ส่งบิลเข้ากลุ่มแล้ว '+sent.length+' ห้อง'+(noGroup.length?' · ไม่มีกลุ่ม: '+noGroup.join(', '):'')+(failed.length?' · ส่งไม่สำเร็จ: '+failed.join(', '):''), (noGroup.length||failed.length)?'warn':'ok');
+    // step 2: show the exact LINE text of every selected bill; nothing is sent until the second confirmation
+    const previews = [];
+    for(let i=0;i<ids.length;i+=100){ const r = await lineCallPreview('send_bills', {invoiceIds: ids.slice(i,i+100), resend: state.resend, preview:true}); previews.push(...(r.previews||[])); }
+    if(!previews.length) throw new Error('ไม่มีใบแจ้งหนี้ที่ส่งได้ในรายการที่เลือก (อาจส่งไปแล้ว หรือถูกยกเลิก/ชำระแล้ว)');
+    const sendable = previews.filter(p=>p.hasGroup);
+    openSendPreview({title:'ตรวจข้อความบิลก่อนส่ง — '+sendable.length+' ห้อง', confirmLabel:'ยืนยันส่งบิล '+sendable.length+' ห้อง',
+      note: previews.length!==sendable.length ? 'ห้องที่ยังไม่ผูกกลุ่มไลน์จะไม่ถูกส่ง (ติดป้ายไว้)' : '',
+      items: previews.map(p=>({label:'ห้อง '+p.roomCode, text:p.text, warn: p.hasGroup?'':'ยังไม่มีกลุ่ม — ไม่ส่ง'})),
+      onBack: ()=>openSendBillsModal({period, onlyId}),
+      onConfirm: async ()=>{
+        if(!sendable.length) throw new Error('ไม่มีห้องที่ผูกกลุ่มไลน์');
+        const sent=[], noGroup=[], failed=[];
+        const sids = sendable.map(p=>p.id);
+        for(let i=0;i<sids.length;i+=100){
+          const r = await lineCall('send_bills', {invoiceIds: sids.slice(i,i+100), resend: state.resend});
+          sent.push(...r.sent); noGroup.push(...r.noGroup); failed.push(...r.failed);
+        }
+        toast('ส่งบิลเข้ากลุ่มแล้ว '+sent.length+' ห้อง'+(noGroup.length?' · ไม่มีกลุ่ม: '+noGroup.join(', '):'')+(failed.length?' · ส่งไม่สำเร็จ: '+failed.join(', '):''), (noGroup.length||failed.length)?'warn':'ok');
+      }});
   }, bodyHtml:
     '<div class="help-box">ตรวจยอดแต่ละห้องให้ถูกต้องก่อนส่ง · ระบบ<b>ไม่ส่งบิลอัตโนมัติ</b> · ห้องที่ยังไม่ผูกกลุ่มไลน์จะไม่ได้รับบิล และระบบจะแจ้งรายชื่อห้องเหล่านั้นเข้ากลุ่มพนักงาน</div>'+
     (onlyId ? '' : '<div class="field-row"><div class="field"><label>งวดบิล</label><select id="sbPeriod">'+periods.map(p=>'<option value="'+p+'" '+(p===state.period?'selected':'')+'>'+periodLabel(p)+'</option>').join('')+'</select></div>'+
@@ -2829,10 +2896,11 @@ async function initAutoSettings(card){
       chk('autoBilling', a.autoBilling, 'ออกใบแจ้งหนี้ให้ทุกห้องอัตโนมัติ เมื่อจดมิเตอร์น้ำ-ไฟครบทุกห้อง (ถ้าไม่ครบ แจ้งพนักงานเวลา 10:00 และ 17:00 และตั้งแต่วันที่ 3 จะออกบิลเฉพาะห้องที่จดแล้ว) — <b>ระบบไม่ส่งบิลเข้ากลุ่มเอง</b> ADMIN/OWNER ตรวจแล้วกดส่งที่หน้า "ใบแจ้งหนี้" (ทีละห้อง หรือทั้งหอพัก)')+
       '<div class="field"><label>เริ่มทำงานตั้งแต่เวลา (ชั่วโมง 0–23 เวลาไทย)</label><input name="billingHour" type="number" min="0" max="23" value="'+a.billingHour+'"></div>'+
       '<div class="field"><label>ข้อมูลการชำระเงินที่แนบท้ายบิล — ค่าเริ่มต้น (ใช้กับทุกหอพักที่ไม่ได้ระบุบัญชีเฉพาะด้านล่าง)</label><textarea name="payInfo" rows="3" maxlength="600" placeholder="เช่น ธ.กสิกรไทย 123-4-56789-0 ชื่อบัญชี …">'+escapeHtml(a.payInfo||'')+'</textarea></div>'+activeProperties().map(pr=>'<div class="field"><label>บัญชีรับโอนเฉพาะหอพัก '+escapeHtml(pr.name)+' ('+escapeHtml(pr.code)+') — เว้นว่าง = ใช้ค่าเริ่มต้น</label><textarea name="payInfoProp_'+pr.id+'" rows="3" maxlength="600">'+escapeHtml((a.payInfoByProp||{})[pr.id]||'')+'</textarea></div>').join('')+''+
-      '<h4 style="margin:14px 0 4px;">2. ทวงถามยอดค้าง (วันที่ 5, วันที่ 8 แล้วซ้ำจนกว่าจะชำระครบ)</h4>'+
-      chk('reminders', a.reminders, 'ส่งข้อความทวงถามเข้ากลุ่มห้องที่ยังไม่ชำระ/ชำระไม่ครบ (เฉพาะใบแจ้งหนี้ที่ส่งเข้ากลุ่มแล้ว)')+
-      '<div class="field"><label>หลังวันที่ 8 ทวงซ้ำทุกกี่วัน (0 = ไม่ทวงซ้ำ)</label><input name="repeatEvery" type="number" min="0" max="30" value="'+a.repeatEvery+'"></div>'+
-      '<div class="field"><label>ส่งทวงถามตั้งแต่เวลา (ชั่วโมง 0–23)</label><input name="remindHour" type="number" min="0" max="23" value="'+a.remindHour+'"></div>'+
+      '<h4 style="margin:14px 0 4px;">2. แจ้งเตือน/ติดตามค่าห้องที่ค้าง (วันที่ 5 เตือนเบาๆ · วันที่ 10 ติดตามแบบสุภาพ · แล้วซ้ำจนกว่าจะชำระครบ)</h4>'+
+      '<p class="hint" style="margin:0 0 6px;">วันที่ 5: “อย่าลืมชำระค่าห้องด้วยนะครับ” พร้อมยอดที่ต้องชำระ ชื่อและเลขที่บัญชีอีกรอบ · วันที่ 10 เป็นต้นไป: “ขอเรียนติดตามค่าห้องที่ยังไม่ได้รับชำระนะครับ” (ภาษาสุภาพ ไม่ขู่) — ดูตัวอย่างข้อความจริงได้ที่ปุ่มทดลองด้านล่าง</p>'+
+      chk('reminders', a.reminders, 'ส่งข้อความแจ้งเตือน/ติดตามเข้ากลุ่มห้องที่ยังไม่ชำระ/ชำระไม่ครบ (เฉพาะใบแจ้งหนี้ที่ส่งเข้ากลุ่มแล้ว)')+
+      '<div class="field"><label>หลังวันที่ 10 ติดตามซ้ำทุกกี่วัน (0 = ไม่ติดตามซ้ำ)</label><input name="repeatEvery" type="number" min="0" max="30" value="'+a.repeatEvery+'"></div>'+
+      '<div class="field"><label>ส่งแจ้งเตือนตั้งแต่เวลา (ชั่วโมง 0–23)</label><input name="remindHour" type="number" min="0" max="23" value="'+a.remindHour+'"></div>'+
       '<h4 style="margin:14px 0 4px;">3. สลิปที่ลูกบ้านส่งในกลุ่ม (ADMIN/OWNER ตรวจยอดก่อนยืนยัน)</h4>'+
       '<p class="hint" style="margin:0 0 6px;">ลูกบ้านส่งรูปสลิป → ระบบบันทึก "รอตรวจสอบ" + แจ้งกลุ่มพนักงาน + ตอบรับสั้นๆ ในกลุ่มห้อง → ADMIN/OWNER ตรวจยอดที่หน้า "การรับชำระเงิน" แล้วกดยืนยัน จึงบันทึกรับชำระและแจ้ง "ได้รับชำระเรียบร้อย" (ทำงานได้แม้ไม่ใส่ API key)</p>'+
       chk('slipCheck', a.slipCheck, 'ให้ระบบอ่านสลิปช่วย (EasySlip) แสดงยอด/ผู้โอน และเตือนสลิปซ้ำ/เก่า/บัญชีผู้รับไม่ตรง — ไม่บันทึกรับชำระเอง (ต้องใส่ API key)')+
@@ -2846,7 +2914,8 @@ async function initAutoSettings(card){
     '<p class="hint" style="margin:0 0 8px;">ทดลอง = คำนวณให้ดูเฉยๆ ไม่ออกบิลและไม่ส่งไลน์ · ปุ่ม “ทำทันที” ทำจริง (ต้องกดยืนยัน)</p>'+
     '<div class="tag-row" style="display:flex;gap:8px;flex-wrap:wrap;">'+
       '<button class="btn" id="autoDryBill">ทดลองออกบิลงวดนี้</button>'+
-      '<button class="btn" id="autoDryRem">ทดลองทวงถาม</button>'+
+      '<button class="btn" id="autoDryRem">ทดลองข้อความวันที่ 5 (เตือนเบาๆ)</button>'+
+      '<button class="btn" id="autoDryRem10">ทดลองข้อความวันที่ 10 (ติดตาม)</button>'+
     '</div><pre id="autoOut" style="white-space:pre-wrap;font-size:12.5px;background:var(--surface-2,rgba(0,0,0,.04));padding:10px;border-radius:8px;margin-top:10px;display:none;"></pre>'+
     '<h4 style="margin:20px 0 6px;">กลุ่มไลน์ของแต่ละห้อง ('+linked+'/'+rooms.length+' ห้องผูกแล้ว)</h4>'+
     '<p class="hint" style="margin:0 0 8px;">เชิญบอทเข้ากลุ่มของห้อง แล้วตั้งชื่อกลุ่มให้มีรหัสห้อง (เช่น KM101, หอพลอย#1) ระบบจะผูกให้อัตโนมัติเมื่อบอทเข้ากลุ่ม หรือกด “จับคู่อัตโนมัติ” / เลือกเองในตาราง · พบกลุ่มแล้ว '+seenArr.length+' กลุ่ม</p>'+
@@ -2881,9 +2950,12 @@ async function initAutoSettings(card){
   };
   $('#autoDryBill', card).addEventListener('click', e=>run(e.target, {task:'billing', dry:true}, l=>
     'ทดลองออกบิลงวดนี้ (ไม่มีการบันทึกหรือส่งจริง)\nมิเตอร์: จดแล้ว '+(l.meters?l.meters.done+'/'+l.meters.required:'-')+' · ห้องที่ยังขาด '+(l.meters?l.meters.missing:'-')+'\nจะออกบิล: '+((l.generated||[]).join(', ')||'-')+'\nข้าม: '+((l.skippedRooms||[]).map(x=>x.code+' ('+x.why+')').join(', ')||'-')));
-  $('#autoDryRem', card).addEventListener('click', e=>run(e.target, {task:'reminders', dry:true, kind:'D5'}, l=>{
+  const remOut = (title)=>l=>{
     const r = l.reminders||{};
-    return 'ทดลองทวงถาม (ไม่ส่งจริง)\nห้องที่ค้างและมีกลุ่มไลน์ จะส่งถึง: '+((r.sent||[]).join(', ')||'-')+'\nค้างแต่ไม่มีกลุ่มไลน์: '+((r.noGroup||[]).join(', ')||'-')+'\nยอดค้างรวม '+Number(r.total||0).toLocaleString('th-TH')+' บาท'; }));
+    return title+' (ไม่ส่งจริง)\nห้องที่ค้างและมีกลุ่มไลน์ จะส่งถึง: '+((r.sent||[]).join(', ')||'-')+'\nค้างแต่ไม่มีกลุ่มไลน์: '+((r.noGroup||[]).join(', ')||'-')+'\nยอดค้างรวม '+Number(r.total||0).toLocaleString('th-TH')+' บาท'+
+      (r.sample ? '\n\n── ตัวอย่างข้อความที่จะส่ง (ห้องแรกที่ค้าง) ──\n'+r.sample : ''); };
+  $('#autoDryRem', card).addEventListener('click', e=>run(e.target, {task:'reminders', dry:true, kind:'D5'}, remOut('ทดลองแจ้งเตือนวันที่ 5')));
+  $('#autoDryRem10', card).addEventListener('click', e=>run(e.target, {task:'reminders', dry:true, kind:'D10'}, remOut('ทดลองติดตามวันที่ 10')));
   $('#autoRematch', card).addEventListener('click', async e=>{
     e.target.disabled = true;
     try{ const r = await lineCall('rematch'); toast('จับคู่เพิ่ม '+r.added+' ห้อง','ok'); initAutoSettings(card); }catch(err){ toast(err.message,'err'); e.target.disabled=false; }
@@ -3009,14 +3081,21 @@ async function renderSlipPanelAt(sel){
 async function openSlipReviewModal(sl){
   const open = openInvoicesOf(sl.roomId);
   const owed = open.reduce((s,x)=>s+x.rem,0);
-  const back = openModal({title:'ตรวจสลิป — ห้อง '+sl.roomCode, wide:true, submitLabel:'ยืนยันยอด และแจ้งรับชำระในกลุ่ม', onSubmit: async fd=>{
+  const back = openModal({title:'ตรวจสลิป — ห้อง '+sl.roomCode, wide:true, submitLabel:'ต่อไป: ดูข้อความที่จะแจ้งในกลุ่ม', onSubmit: async fd=>{
     const amount = Number(fd.get('amount'));
     if(!(amount>0)) throw new Error('กรอกยอดเงินที่ตรวจสอบแล้ว');
     if(!fd.get('checked')) throw new Error('ติ๊กยืนยันว่าตรวจยอดเงินเข้าบัญชีแล้ว');
-    const r = await lineCall('slip_approve', {slipId: sl.id, amount, invoiceId: fd.get('invoiceId')||undefined});
+    const invoiceId = fd.get('invoiceId')||undefined;
+    const pv = await lineCallPreview('slip_approve', {slipId: sl.id, amount, invoiceId, dry:true});
+    openSendPreview({title:'ตรวจข้อความก่อนยืนยัน — ห้อง '+sl.roomCode, confirmLabel:'ยืนยัน บันทึกรับชำระ '+money(amount)+' บาท และส่งข้อความนี้',
+      note:'เมื่อกดยืนยัน ระบบจะ<b>บันทึกรับชำระ ออกใบเสร็จ</b>และส่งข้อความนี้พร้อมกัน (เลขที่ใบเสร็จจริงจะแทนที่ข้อความในวงเล็บ)',
+      items:[{label:'ข้อความที่จะส่งเข้ากลุ่มห้อง '+sl.roomCode, text:pv.message}], onBack: ()=>openSlipReviewModal(sl),
+      onConfirm: async ()=>{
+    const r = await lineCall('slip_approve', {slipId: sl.id, amount, invoiceId});
     await logAudit({action:'APPROVE_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, amount, receipts:r.receipts, notified:r.notified}});
     toast('บันทึกรับชำระ '+money(amount)+' บาท ห้อง '+sl.roomCode+' แล้ว'+(r.notified?' · แจ้งในกลุ่มห้องแล้ว':' · แต่ส่งข้อความเข้ากลุ่มไม่สำเร็จ'+(r.notifyError?' ('+r.notifyError+')':'')), r.notified?'ok':'warn');
     renderSlipPanel();
+      }});
   }, bodyHtml:
     '<div class="help-box">ตรวจยอดเงินในสลิปให้ตรงกับที่เข้าบัญชีก่อน เมื่อยืนยัน ระบบจะบันทึกรับชำระ ออกเลขที่ใบเสร็จ และส่งข้อความ "ได้รับชำระเงินเรียบร้อย" เข้ากลุ่มห้อง</div>'+
     ((sl.flags||[]).length ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);color:var(--danger);">'+sl.flags.map(f=>'⚠ '+escapeHtml(f)).join('<br>')+'</div>' : '')+
@@ -3040,9 +3119,15 @@ async function openSlipReviewModal(sl){
 }
 function openSlipRejectModal(sl, parentBack){
   openModal({title:'ยกเลิกสลิป — ห้อง '+sl.roomCode, submitLabel:'ยืนยันยกเลิกสลิป', onSubmit: async fd=>{
-    const r = await lineCall('slip_reject', {slipId: sl.id, reason: fd.get('reason')||'', notify: fd.get('notify')==='on'});
-    await logAudit({action:'REJECT_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, reason: fd.get('reason')||''}});
-    toast('ยกเลิกสลิปแล้ว'+(r.notified?' · แจ้งในกลุ่มห้องแล้ว':''),'ok'); if(parentBack) parentBack.remove(); renderSlipPanel();
+    const reason = fd.get('reason')||'', notify = fd.get('notify')==='on';
+    const doReject = async ()=>{
+      const r = await lineCall('slip_reject', {slipId: sl.id, reason, notify});
+      await logAudit({action:'REJECT_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, reason}});
+      toast('ยกเลิกสลิปแล้ว'+(r.notified?' · แจ้งในกลุ่มห้องแล้ว':''),'ok'); if(parentBack) parentBack.remove(); renderSlipPanel();
+    };
+    if(!notify){ await doReject(); return; }
+    const pv = await lineCallPreview('slip_reject', {slipId: sl.id, reason, notify:true, dry:true});
+    openSendPreview({title:'ตรวจข้อความก่อนส่ง — ห้อง '+sl.roomCode, confirmLabel:'ยืนยันยกเลิกสลิปและส่งข้อความนี้', items:[{label:'ข้อความที่จะส่งเข้ากลุ่มห้อง '+sl.roomCode, text:pv.message}], onConfirm: doReject});
   }, bodyHtml:'<div class="field"><label>เหตุผล (เช่น ยอดไม่ตรง / ไม่ใช่สลิป / ยังไม่เห็นยอดเข้าบัญชี)</label><textarea name="reason" required></textarea></div>'+
     '<label style="display:flex;gap:8px;align-items:center;font-weight:400;"><input type="checkbox" name="notify" style="width:auto;" checked> แจ้งในกลุ่มห้องให้ส่งสลิปใหม่</label>'});
 }
@@ -3108,16 +3193,18 @@ function renderPayments(root){
     '<td>'+METHOD_LABEL[p.method]+'</td>'+
     '<td>'+(p.slipDataUrl? '<img class="photo-thumb" data-zoom="'+p.slipDataUrl+'" src="'+p.slipDataUrl+'">' : '<span class="pill bad">ไม่มี</span>')+'</td>'+
     '<td>'+escapeHtml(p.receivedByName)+'</td><td>'+fmtDateTime(p.receivedAt)+'</td>'+
-    '<td><span class="pill '+stMap[p.status]+'">'+stLabel[p.status]+'</span></td>'+
+    '<td><span class="pill '+stMap[p.status]+'">'+stLabel[p.status]+'</span>'+(p.status==='void' && p.source==='line-slip' ? '<div class="footnote" style="margin:2px 0 0;">'+(p.lineCancelNotifiedAt?'แจ้งยกเลิกเข้ากลุ่มแล้ว':'ยังไม่ได้แจ้งยกเลิกเข้ากลุ่ม')+'</div>' : '')+'</td>'+
     '<td style="text-align:right;white-space:nowrap;">'+
+      (p.status==='void' && p.source==='line-slip' && !p.lineCancelNotifiedAt && can('SEND_BILLS') ? '<button class="btn sm primary" data-cancelnotice="'+p.id+'" data-ckind="payment">'+icon('send')+' ส่งแจ้งยกเลิกเข้ากลุ่ม</button>' : '')+
       (p.status==='active' ? '<button class="btn sm" data-void="'+p.id+'">ขอยกเลิก</button> <button class="btn sm" data-refund="'+p.id+'">ขอคืนเงิน</button>' : '')+
     '</td></tr>'
   ).join('');
   $all('[data-zoom]', body).forEach(img=>img.addEventListener('click', ()=>lightbox(img.dataset.zoom)));
+  wireCancelNoticeButtons(body);
   $all('[data-void]', body).forEach(b=>b.addEventListener('click', ()=>{
     const p = cache.payments.find(x=>x.id===b.dataset.void);
     openModal({title:'ขอยกเลิกใบเสร็จ '+p.receiptNumber, submitLabel:'ส่งคำขอ', onSubmit: async fd=>{ await requestVoidPayment(p, fd.get('reason')); },
-      bodyHtml:'<div class="help-box">การยกเลิกใบเสร็จต้องได้รับอนุมัติจากเจ้าของกิจการ ใบเสร็จจะยังคงอยู่ในลำดับเลขที่เสมอ ไม่ถูกลบ — รับชำระใหม่อีกครั้งเพื่อออกใบเสร็จเลขใหม่แทนได้หลังอนุมัติ</div><div class="field"><label>เหตุผล</label><textarea name="reason" required></textarea></div>'});
+      bodyHtml:(p.source==='line-slip'?'<div class="help-box">ใบเสร็จนี้ออกจากสลิปในกลุ่มไลน์ — เมื่อเจ้าของอนุมัติ ระบบจะส่งข้อความแจ้งยกเลิกใบเสร็จเข้ากลุ่มห้องให้อัตโนมัติ</div>':'')+'<div class="help-box">การยกเลิกใบเสร็จต้องได้รับอนุมัติจากเจ้าของกิจการ ใบเสร็จจะยังคงอยู่ในลำดับเลขที่เสมอ ไม่ถูกลบ — รับชำระใหม่อีกครั้งเพื่อออกใบเสร็จเลขใหม่แทนได้หลังอนุมัติ</div><div class="field"><label>เหตุผล</label><textarea name="reason" required></textarea></div>'});
   }));
   $all('[data-refund]', body).forEach(b=>b.addEventListener('click', ()=>{
     const p = cache.payments.find(x=>x.id===b.dataset.refund);
@@ -3583,6 +3670,8 @@ function renderMoveOuts(root){
     const act = [];
     if(can('MANAGE_ROOMS')){
       if(m.status==='DRAFT') act.push('<button class="btn sm" data-moedit="'+m.id+'">แก้ไขตัวเลข</button>');
+      if(['NOTIFIED','ACCOUNT_RECEIVED'].includes(m.status) && can('SEND_BILLS')) act.push('<button class="btn sm" data-mocancel="'+m.id+'">ยกเลิกสรุปที่ส่งผิด</button>');
+      if(m.status==='DRAFT' && m.cancelledSummaryAt && m.lineSentAtPrev && (!m.lineCancelNotifiedAt || m.lineCancelNotifiedAt < m.cancelledSummaryAt) && can('SEND_BILLS')) act.push('<button class="btn sm primary" data-cancelnotice="'+m.id+'" data-ckind="moveout">'+icon('send')+' ส่งแจ้งยกเลิกเข้ากลุ่ม</button>');
       if(['DRAFT'].includes(m.status) && can('SEND_BILLS')) act.push('<button class="btn sm primary" data-mosend="'+m.id+'">ตรวจข้อความและส่งแจ้งลูกค้า</button>');
       if(m.status!=='DRAFT' && m.refund>0 && !['REFUNDED','SETTLED'].includes(m.status) && can('SEND_BILLS')) act.push('<button class="btn sm" data-moask="'+m.id+'">ส่งขอเลขบัญชีอีกครั้ง</button>');
       if(['NOTIFIED','ACCOUNT_RECEIVED'].includes(m.status) && m.refund>0) act.push('<button class="btn sm'+(m.status==='NOTIFIED'?' primary':'')+'" data-mobank="'+m.id+'">'+(b?'แก้ไขเลขบัญชี':'บันทึกเลขบัญชีลูกค้า')+'</button>');
@@ -3595,6 +3684,7 @@ function renderMoveOuts(root){
       (lines? '<table class="grid" style="margin:8px 0;max-width:560px;"><tbody>'+lines+'</tbody></table>':'')+
       (b? '<div class="alert-detail">บัญชีรับเงินคืน: '+escapeHtml(b.bankName)+' · '+escapeHtml(b.accountNo)+' · '+escapeHtml(b.accountName)+(b.note?' · '+escapeHtml(b.note):'')+'</div>':'')+
       (msgs.length? '<div class="alert-meta" style="margin-top:4px;">ลูกค้าตอบในกลุ่ม: '+msgs.map(x=>'“'+escapeHtml(x.text||('['+(x.type||'ข้อความ')+']'))+'” ('+fmtDateTime(x.at)+')').join(' · ')+'</div>':'')+
+      (m.status==='DRAFT' && m.cancelledSummaryAt ? '<div class="alert-meta">ยกเลิกสรุปที่ส่งไว้ '+fmtDateTime(m.cancelledSummaryAt)+(m.cancelReason?' · '+escapeHtml(m.cancelReason):'')+' · '+(m.lineCancelNotifiedAt && m.lineCancelNotifiedAt>=m.cancelledSummaryAt ? 'แจ้งยกเลิกเข้ากลุ่มแล้ว' : 'ยังไม่ได้แจ้งยกเลิกเข้ากลุ่ม')+'</div>':'')+
       (m.lineSentAt? '<div class="alert-meta">แจ้งลูกค้าแล้ว '+fmtDateTime(m.lineSentAt)+(m.lineSentByName?' โดย '+escapeHtml(m.lineSentByName):'')+'</div>':'')+
       (m.refundedAt? '<div class="alert-meta">โอนคืน '+money(m.refundAmount||m.refund)+' บาท เมื่อ '+fmtThaiDate(m.refundDate||'')+(m.refundRef?' · '+escapeHtml(m.refundRef):'')+' · บันทึกโดย '+escapeHtml(m.refundedByName||'')+'</div>':'')+
       '</div><div class="tag-row" style="flex-wrap:wrap;justify-content:flex-end;">'+act.join('')+'</div></div>';
@@ -3603,6 +3693,13 @@ function renderMoveOuts(root){
   $('#moDone').innerHTML = done.length ? done.map(card).join('') : '<div class="empty-row">ยังไม่มีรายการ</div>';
   const find = id => cache.moveOuts.find(x=>x.id===id);
   $all('[data-moedit]', root).forEach(b=>b.addEventListener('click', ()=>{ const m = find(b.dataset.moedit); openMoveOutModal({id:m.leaseId, roomId:m.roomId, roomCode:m.roomCode, tenantId:m.tenantId, tenantName:m.tenantName, rent:(roomById(m.roomId)||{}).rent, deposit:m.deposit}, m); }));
+  wireCancelNoticeButtons(root);
+  $all('[data-mocancel]', root).forEach(b=>b.addEventListener('click', async ()=>{ const m = find(b.dataset.mocancel);
+    let pvText = ''; try{ pvText = (await lineCallPreview('notify_cancel', {kind:'moveout', id:m.id, preview:true})).text || ''; }catch(e){ pvText = ''; }
+    openModal({title:'ยกเลิกสรุปที่ส่งผิด — ห้อง '+m.roomCode, submitLabel:'ยกเลิกสรุปและแจ้งในกลุ่ม', onSubmit: async fd=>{ await cancelMoveOutSummary(m, fd.get('reason')); },
+      bodyHtml:'<div class="help-box">รายการจะกลับเป็น "ยังไม่แจ้งลูกค้า" เพื่อแก้ไขตัวเลขแล้วส่งสรุปใหม่ ระบบจะส่งข้อความแจ้งยกเลิกสรุปฉบับเดิมเข้ากลุ่มไลน์ห้องนี้ให้อัตโนมัติ (LINE ลบข้อความที่ส่งไปแล้วไม่ได้) เลขบัญชีที่ลูกค้าให้ไว้ยังเก็บไว้ ใช้ได้ต่อ</div><div class="field"><label>เหตุผลที่ยกเลิก (บันทึกภายใน ไม่ส่งในกลุ่ม)</label><textarea name="reason" required></textarea></div>'+
+        (pvText ? '<div class="field"><label>ข้อความที่จะส่งเข้ากลุ่มไลน์เมื่อกดยืนยัน</label><textarea readonly style="width:100%;min-height:170px;font-family:inherit;">'+escapeHtml(pvText)+'</textarea></div>' : '') });
+  }));
   $all('[data-mosend]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutSendModal(find(b.dataset.mosend),'summary')));
   $all('[data-moask]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutSendModal(find(b.dataset.moask),'account')));
   $all('[data-mobank]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutBankModal(find(b.dataset.mobank))));
@@ -3610,6 +3707,14 @@ function renderMoveOuts(root){
   $all('[data-moclose]', root).forEach(b=>b.addEventListener('click', ()=>{ const m = find(b.dataset.moclose);
     confirmModal({title:'ปิดรายการ — ห้อง '+m.roomCode, submitLabel:'ปิดรายการ', bodyHtml:'<p>'+(m.refund<0?'ยืนยันว่าได้รับชำระส่วนที่ขาด '+money(-m.refund)+' บาท จากลูกค้าแล้ว?':'ยืนยันปิดรายการ (ไม่มียอดคืน)?')+'</p>',
       onSubmit: async ()=>{ await Store.update('moveOuts', m.id, {status:'SETTLED', settledAt:nowIso(), settledByName:Session.user.name}); await logAudit({action:'SETTLE_MOVEOUT', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, refund:m.refund}}); toast('ปิดรายการแล้ว','ok'); }}); }));
+}
+async function cancelMoveOutSummary(m, reason){
+  if(!reason || !reason.trim()) throw new Error('ต้องระบุเหตุผลที่ยกเลิกสรุป');
+  if(['REFUNDED','SETTLED'].includes(m.status)) throw new Error('รายการนี้ปิดแล้ว ยกเลิกสรุปไม่ได้');
+  await Store.update('moveOuts', m.id, { status:'DRAFT', lineSentAtPrev: m.lineSentAt || m.lineSentAtPrev || '', lineSentAt:'', cancelledSummaryAt: nowIso(), cancelledSummaryBy: Session.user.name, cancelReason: reason.trim() });
+  await logAudit({action:'CANCEL_MOVEOUT_SUMMARY', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, reason:reason.trim()}});
+  toast('ยกเลิกสรุปห้อง '+m.roomCode+' แล้ว — แก้ไขตัวเลขแล้วส่งใหม่ได้','ok');
+  await notifyCancelLine('moveout', m.id);
 }
 async function openMoveOutSendModal(m, kind){
   let text = '';
@@ -3692,8 +3797,16 @@ function renderApprovals(root){
   $all('[data-approve]', pw).forEach(b=>b.addEventListener('click', async ()=>{
     const a = cache.approvals.find(x=>x.id===b.dataset.approve);
     const self = a.requestedBy===Session.user.id;
+    let extraHtml = '';
+    if(a.type==='INVOICE_CANCEL' || a.type==='VOID_PAYMENT'){
+      try{
+        const r = await lineCallPreview('notify_cancel', {kind: a.type==='INVOICE_CANCEL'?'invoice':'payment', id:a.entityId, preview:true});
+        extraHtml = r.text ? '<div class="help-box" style="margin-top:10px;"><b>เมื่ออนุมัติ ระบบจะส่งข้อความนี้เข้ากลุ่มไลน์ห้องให้ทันที</b> — ตรวจข้อความก่อนกดยืนยัน</div><textarea readonly style="width:100%;min-height:150px;font-family:inherit;">'+escapeHtml(r.text)+'</textarea>'
+          : '<p class="hint">รายการนี้ไม่เคยส่งเข้ากลุ่มไลน์ จึงไม่มีข้อความแจ้งยกเลิก</p>';
+      }catch(e){ extraHtml = '<p class="hint">ดูตัวอย่างข้อความแจ้งยกเลิกไม่ได้ ('+escapeHtml(e.message)+') — อนุมัติแล้วระบบจะพยายามส่งแจ้งยกเลิกเข้ากลุ่มให้</p>'; }
+    }
     confirmModal({title:'อนุมัติคำขอ', submitLabel:'ยืนยันอนุมัติ', bodyHtml:'<p>อนุมัติคำขอ “'+APPROVAL_TYPE_LABEL[a.type]+'”'+(a.roomCode&&a.roomCode!=='-'?' ห้อง '+escapeHtml(a.roomCode):'')+(a.amount?' ('+money(a.amount)+' บาท)':'')+' ใช่หรือไม่?</p>'+
-      (self?'<div class="help-box">คำขอนี้คุณเป็นผู้ร้องขอเอง — ในฐานะเจ้าของกิจการอนุมัติได้ และระบบจะบันทึกไว้ในบันทึกตรวจสอบว่าอนุมัติเอง</div>':''),
+      (self?'<div class="help-box">คำขอนี้คุณเป็นผู้ร้องขอเอง — ในฐานะเจ้าของกิจการอนุมัติได้ และระบบจะบันทึกไว้ในบันทึกตรวจสอบว่าอนุมัติเอง</div>':'')+extraHtml,
       onSubmit: async ()=>{ await resolveApproval(a,'APPROVED'); }});
   }));
   $all('[data-reject]', pw).forEach(b=>b.addEventListener('click', ()=>{
@@ -3754,7 +3867,7 @@ function renderSettings(root){
       '<p style="font-size:13px;color:var(--text-muted);">เฉพาะเจ้าของกิจการเท่านั้นที่แก้ไขได้ — ค่าปัจจุบัน: น้ำ '+cfg.waterRate+' บาท/หน่วย · ไฟ '+cfg.elecRate+' บาท/หน่วย · ส่วนกลาง '+(cfg.defaultCommonFee||0)+' บาท · เกณฑ์ห้องว่างผิดปกติ '+cfg.vacantUsageThreshold+' หน่วย · เกณฑ์ผิดปกติ ±'+cfg.anomalyPercent+'% · วงเงินส่วนลด Admin '+cfg.discountApprovalThreshold+' บาท</p>')+
     '</div></div>'+
     (can('MANAGE_SETTINGS') ? '<div class="card" id="lineCard"><div class="card-head"><div><h3>แจ้งเตือน LINE</h3><div class="desc">ส่งสรุปบิลเข้ากลุ่มไลน์ของพนักงานด้วยปุ่มเดียว (เฉพาะเจ้าของกิจการตั้งค่าได้)</div></div></div><div class="card-body" id="lineBody"><p style="font-size:13px;color:var(--text-muted);">กำลังโหลด…</p></div></div>' : '')+
-    (can('MANAGE_SETTINGS') ? '<div class="card" id="autoCard"><div class="card-head"><div><h3>ระบบอัตโนมัติ: ออกบิล · ส่งไลน์ · ตรวจสลิป · ทวงถาม</h3><div class="desc">ทำงานเองบนเซิร์ฟเวอร์ทุกชั่วโมง ไม่ต้องเปิดแอป (เฉพาะเจ้าของกิจการตั้งค่าได้)</div></div></div><div class="card-body" id="autoBody"><p style="font-size:13px;color:var(--text-muted);">กำลังโหลด…</p></div></div>' : '')+
+    (can('MANAGE_SETTINGS') ? '<div class="card" id="autoCard"><div class="card-head"><div><h3>ระบบอัตโนมัติ: ออกบิล · ส่งไลน์ · ตรวจสลิป · แจ้งเตือนค่าห้อง</h3><div class="desc">ทำงานเองบนเซิร์ฟเวอร์ทุกชั่วโมง ไม่ต้องเปิดแอป (เฉพาะเจ้าของกิจการตั้งค่าได้)</div></div></div><div class="card-body" id="autoBody"><p style="font-size:13px;color:var(--text-muted);">กำลังโหลด…</p></div></div>' : '')+
     '<div class="card"><div class="card-head"><div><h3>ทีมงาน &amp; บัญชีผู้ใช้งาน</h3><div class="desc">Segregation of Duties — Owner/Admin เป็นผู้สร้างบัญชี (ชื่อผู้ใช้/รหัสผ่าน) ให้พนักงานเท่านั้น · เจ้าของกิจการปิดใช้งานบัญชีใครก็ได้ (ยกเว้นตัวเอง) · ผู้ดูแลระบบปิดใช้งานบัญชี Staff/Admin คนอื่นได้ แต่ปิดใช้งานบัญชีเจ้าของกิจการไม่ได้ · ไม่มีใครปิดใช้งานบัญชีตัวเองได้</div></div>'+
       (can('MANAGE_STAFF') && allowedRolesToAssign().length? '<button class="btn sm primary" id="addStaffBtn2">'+icon('plus')+' สร้างบัญชีพนักงานใหม่</button>':'')+'</div>'+
     '<div class="tbl-wrap"><table class="grid"><thead><tr><th>ชื่อ</th><th>ชื่อผู้ใช้ (username)</th><th>เบอร์โทร</th><th>บทบาท</th><th>สถานะ</th><th></th></tr></thead><tbody id="staffBody">'+
