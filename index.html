@@ -332,7 +332,7 @@ function roomWaterFlatFee(room){ return (room && room.waterFlatFee!=null) ? Numb
 /* Minimum water charge for metered (SEPARATE) rooms: e.g. 100 baht = the first 4 units (at 25/unit); usage above that is billed at the actual rate. */
 function roomWaterMinFee(room){ const n = Number(room && room.waterMinFee); return Number.isFinite(n) && n>0 ? n : 0; }
 function calcSeparateWater(room, usage, rate){
-  const actual = Math.round(Number(usage||0)*Number(rate||0)*100)/100, min = roomWaterMinFee(room);
+  const actual = Math.round(Number(usage||0)*Number(rate||0)*10)/10, min = roomWaterMinFee(room);
   return { amount: Math.max(actual, min), minApplied: min>0 && actual<min, minFee: min };
 }
 const APPROVAL_TYPE_LABEL = {
@@ -922,13 +922,13 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   let waterAmount = 0, waterMinApplied = false;
   if(waterMode==='SEPARATE' && water){ const wc = calcSeparateWater(room, water.usage, cfg.waterRate); waterAmount = wc.amount; waterMinApplied = wc.minApplied; }
   else if(waterMode==='FLAT') waterAmount = roomWaterFlatFee(room);
-  const elecAmount = (elecMode==='SEPARATE' && elec) ? Math.round(elec.usage*cfg.elecRate*100)/100 : 0;
+  const elecAmount = (elecMode==='SEPARATE' && elec) ? Math.round(elec.usage*cfg.elecRate*10)/10 : 0;
   // prepaid months: rent + common fee x N on one bill; water/electric are only for the first month (later months bill utilities only)
   const prepaid = !!cover;
   const rent = prepaid ? 0 : rent1*n;
   const commonFee = prepaid ? 0 : Number(room.commonFee||0)*n;
   discount = Number(discount||0);
-  const total = Math.max(0, Math.round((rent + waterAmount + elecAmount + commonFee - discount)*100)/100);
+  const total = Math.max(0, Math.round((rent + waterAmount + elecAmount + commonFee - discount)*10)/10);
   if(prepaid && total<=0) throw new Error('ห้อง '+roomCode+' ชำระค่าเช่างวด '+periodLabel(period)+' ล่วงหน้าแล้ว (ใบ '+(cover.invoiceNumber||'-')+') และไม่มีค่าน้ำ-ไฟที่ต้องเรียกเก็บ');
 
   let discountState = 'none';
