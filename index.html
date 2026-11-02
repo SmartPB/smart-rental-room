@@ -789,7 +789,7 @@ async function deleteRoom(room){
 }
 
 /* ---- room bookings / reservations ---- */
-async function createReservation({roomId, tenantName, phone, moveInDate, depositAmount, note, depositSlipDataUrl}){
+async function createReservation({roomId, tenantName, phone, moveInDate, depositAmount, rent, note, depositSlipDataUrl}){
   const room = roomById(roomId);
   if(!room) throw new Error('กรุณาเลือกห้องที่ว่าง');
   if(room.status!=='VACANT') throw new Error('จองล่วงหน้าได้เฉพาะห้องว่างเท่านั้น');
@@ -799,14 +799,17 @@ async function createReservation({roomId, tenantName, phone, moveInDate, deposit
   const dep = Number(depositAmount);
   if(isNaN(dep) || dep<=0) throw new Error('ต้องระบุเงินมัดจำ');
   if(!depositSlipDataUrl) throw new Error('ต้องแนบรูปหลักฐานการโอนเงินมัดจำ');
+  // agreed monthly rent for this booking only (the room's list price stays unchanged); blank = the room's list price
+  const agreed = (rent===undefined || rent===null || String(rent).trim()==='') ? Number(room.rent||0) : Number(rent);
+  if(isNaN(agreed) || agreed<=0) throw new Error('ค่าเช่าต่อเดือนต้องมากกว่า 0');
   const prop = propertyById(room.propertyId);
   const id = await Store.add('reservations', {
     propertyId: room.propertyId, propertyCode: prop? prop.code:'', roomId, roomCode: room.code,
-    tenantName: tenantName.trim(), phone:phone.trim(), moveInDate, depositAmount: dep,
+    tenantName: tenantName.trim(), phone:phone.trim(), moveInDate, depositAmount: dep, rent: agreed, listRent: Number(room.rent||0),
     depositSlipDataUrl, note:(note||'').trim(), status:'PENDING', createdBy: Session.user.id, createdByName: Session.user.name, createdAt: nowIso()
   });
   await Store.update('rooms', roomId, {status:'RESERVED'});
-  await logAudit({action:'CREATE_RESERVATION', entityType:'reservation', entityId:id, newValue:{roomCode:room.code, tenantName, moveInDate, depositAmount:dep}});
+  await logAudit({action:'CREATE_RESERVATION', entityType:'reservation', entityId:id, newValue:{roomCode:room.code, tenantName, moveInDate, depositAmount:dep, rent:agreed, listRent:Number(room.rent||0)}});
   toast('จองห้อง '+room.code+' ให้ '+tenantName+' แล้ว','ok');
 }
 async function confirmMoveIn(resv, tenantData){
@@ -2035,7 +2038,7 @@ function openEditStaffModal(s){
 /* Shared tenant-binding form used both from the room "+ ผูกผู้เช่า" action and from
    confirming a room booking. Requires name/address/phone plus ID-card and contract photo
    evidence — anti-fraud requirement. `onSubmit(data)` receives the assembled tenant data. */
-function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhone, prefillDeposit, onSubmit}){
+function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhone, prefillDeposit, prefillRent, prefillStart, onSubmit}){
   openModal({title, submitLabel: submitLabel||'บันทึก', onSubmit: async fd=>{
     const name = (fd.get('name')||'').trim();
     const address = (fd.get('address')||'').trim();
@@ -2054,8 +2057,8 @@ function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhon
     '<div class="field"><label>ชื่อ-สกุลผู้เช่า (*บังคับ)</label><input name="name" required value="'+escapeHtml(prefillName||'')+'"></div>'+
     '<div class="field"><label>ที่อยู่ (*บังคับ)</label><textarea name="address" required placeholder="ที่อยู่ตามบัตรประชาชนหรือที่อยู่ปัจจุบัน"></textarea></div>'+
     '<div class="field"><label>เบอร์โทร (*บังคับ)</label><input name="phone" required placeholder="08x-xxx-xxxx" value="'+escapeHtml(prefillPhone||'')+'"></div>'+
-    '<div class="field-row"><div class="field"><label>ค่าเช่า (บาท) — ตามค่า default (แก้ไขได้)</label><input name="rent" type="number" required value="'+room.rent+'"></div>'+
-    '<div class="field"><label>วันที่เข้าพัก</label><input name="startDate" type="date" required value="'+todayStr()+'"></div></div>'+
+    '<div class="field-row"><div class="field"><label>ค่าเช่า (บาท) — ตามค่า default (แก้ไขได้)</label><input name="rent" type="number" required value="'+(prefillRent!=null?prefillRent:room.rent)+'"></div>'+
+    '<div class="field"><label>วันที่เข้าพัก</label><input name="startDate" type="date" required value="'+(prefillStart||todayStr())+'"></div></div>'+
     '<div class="field"><label>ระยะเวลาสัญญาเช่า (เดือน) (*บังคับ)</label><select name="termMonths" required>'+[1,2,3,4,5,6,7,8,9,10,11,12,18,24,36].map(n=>'<option value="'+n+'" '+(n===12?'selected':'')+'>'+n+' เดือน'+(n===12?' (ค่าเริ่มต้น)':'')+'</option>').join('')+'</select><p class="hint">ถ้าผู้เช่าย้ายออกก่อนครบสัญญา จะไม่คืนเงินมัดจำ · เมื่อครบสัญญาแล้วยังไม่ย้ายออก สัญญาต่ออัตโนมัติด้วยระยะเวลาเท่าเดิม</p></div>'+
     '<div class="field"><label>เงินมัดจำที่รับ (บาท) — ปกติ 1 เดือนของค่าเช่า</label><input name="deposit" type="number" min="0" step="0.01" value="'+(prefillDeposit!=null?prefillDeposit:room.rent)+'"><p class="hint">ใช้คำนวณเงินคืนตอนสิ้นสุดสัญญา</p></div>'+
     '<div class="field"><label>รูปถ่ายบัตรประชาชน (*บังคับ)</label><input name="idCardPhoto" type="file" accept="image/*" capture="environment" required>'+
@@ -2128,7 +2131,7 @@ function renderBookings(root){
     const daysLeft = Math.round((new Date(rv.moveInDate)-new Date(todayStr()))/86400000);
     return '<div class="alert-row"><div class="alert-stripe" style="background:var(--primary);"></div><div style="flex:1;min-width:0;">'+
       '<div class="alert-title">ห้อง '+rv.roomCode+(prop?' · '+escapeHtml(prop.name):'')+' — '+escapeHtml(rv.tenantName)+'</div>'+
-      '<div class="alert-detail">โทร '+escapeHtml(rv.phone||'-')+(rv.depositAmount? ' · มัดจำ '+money(rv.depositAmount)+' บาท':'')+(rv.note? ' · '+escapeHtml(rv.note):'')+'</div>'+
+      '<div class="alert-detail">โทร '+escapeHtml(rv.phone||'-')+(rv.depositAmount? ' · มัดจำ '+money(rv.depositAmount)+' บาท':'')+(rv.rent? ' · ค่าเช่า '+money(rv.rent)+' บาท/เดือน'+(rv.listRent && Number(rv.listRent)!==Number(rv.rent)? ' (ราคาห้องปกติ '+money(rv.listRent)+')':''):'')+(rv.note? ' · '+escapeHtml(rv.note):'')+'</div>'+
       '<div class="alert-meta">วันที่คาดว่าจะเข้าพัก: '+fmtDate(rv.moveInDate)+(daysLeft>=0? ' (อีก '+daysLeft+' วัน)' : ' (เลยกำหนด '+(-daysLeft)+' วัน)')+' · จองโดย '+escapeHtml(rv.createdByName)+'</div>'+
       (rv.depositSlipDataUrl? '<img class="photo-thumb" data-zoom="'+rv.depositSlipDataUrl+'" src="'+rv.depositSlipDataUrl+'" style="margin-top:6px;">' : '')+'</div>'+
       (can('MANAGE_RESERVATIONS')? '<div class="tag-row"><button class="btn sm primary" data-confirm="'+rv.id+'">ยืนยันเข้าพัก</button><button class="btn sm" data-cancelbook="'+rv.id+'">ยกเลิกการจอง</button></div>':'')+
@@ -2139,7 +2142,7 @@ function renderBookings(root){
     const rv = cache.reservations.find(x=>x.id===b.dataset.confirm);
     const room = roomById(rv.roomId);
     openBindTenantModal(room, {title:'ยืนยันเข้าพักห้อง '+rv.roomCode, submitLabel:'ยืนยันเข้าพัก',
-      prefillName:rv.tenantName, prefillPhone:rv.phone, onSubmit: async data=>{ await confirmMoveIn(rv, data); }});
+      prefillName:rv.tenantName, prefillPhone:rv.phone, prefillRent: rv.rent!=null? Number(rv.rent) : null, prefillDeposit: rv.rent!=null? Number(rv.rent) : null, prefillStart: rv.moveInDate||'', onSubmit: async data=>{ await confirmMoveIn(rv, data); }});
   }));
   $all('[data-cancelbook]', pw).forEach(b=>b.addEventListener('click', ()=>{
     const rv = cache.reservations.find(x=>x.id===b.dataset.cancelbook);
@@ -2165,13 +2168,14 @@ function renderBookings(root){
       let depositSlipDataUrl = '';
       if(file && file.size>0) depositSlipDataUrl = await fileToCompressedDataUrl(file);
       await createReservation({roomId:fd.get('roomId'), tenantName:fd.get('tenantName'), phone:fd.get('phone'),
-        moveInDate:fd.get('moveInDate'), depositAmount:fd.get('depositAmount'), note:fd.get('note'), depositSlipDataUrl});
+        moveInDate:fd.get('moveInDate'), depositAmount:fd.get('depositAmount'), rent:fd.get('rent'), note:fd.get('note'), depositSlipDataUrl});
     }, bodyHtml:
       '<div class="field"><label>หอพัก</label><select name="propertyId" id="bookPropSel">'+bookProps.map(p=>
         '<option value="'+p.id+'" '+(p.id===defaultPropId?'selected':'')+'>'+escapeHtml(p.name)+' ('+p.code+')</option>').join('')+'</select></div>'+
       '<div class="field"><label>ห้องว่าง</label><select name="roomId" id="bookRoomSel" required></select></div>'+
       '<div class="field"><label>ชื่อ-สกุล ผู้จอง (*บังคับ)</label><input name="tenantName" required></div>'+
       '<div class="field"><label>เบอร์โทร (*บังคับ)</label><input name="phone" required placeholder="08x-xxx-xxxx"></div>'+
+      '<div class="field"><label>ค่าเช่าต่อเดือน (บาท) — แก้ได้ถ้าต้องการเพิ่ม/ลดราคาเฉพาะการจองนี้</label><input name="rent" id="bookRent" type="number" min="1" step="0.01" required><p class="hint" id="bookRentHint"></p></div>'+
       '<div class="field-row"><div class="field"><label>วันที่จะเข้าพัก (*บังคับ)</label><input name="moveInDate" type="date" required value="'+todayStr()+'"></div>'+
       '<div class="field"><label>เงินมัดจำ (บาท) (*บังคับ)</label><input name="depositAmount" type="number" min="1" required></div></div>'+
       '<div class="field"><label>หมายเหตุ</label><input name="note" placeholder="ไม่บังคับ"></div>'+
@@ -2184,8 +2188,19 @@ function renderBookings(root){
       roomSel.innerHTML = list.map(r=>'<option value="'+r.id+'">'+r.code+' ('+money(r.rent)+' บาท/เดือน)</option>').join('') ||
         '<option value="" disabled selected>ไม่มีห้องว่างในหอนี้</option>';
     }
-    fillRooms();
-    if(propSel) propSel.addEventListener('change', fillRooms);
+    const rentIn = $('#bookRent', modalEl), rentHint = $('#bookRentHint', modalEl);
+    const listRentOf = ()=>{ const r = roomById(roomSel.value); return r ? Number(r.rent||0) : 0; };
+    function rentHintUpdate(){
+      const lr = listRentOf(), v = Number(rentIn.value);
+      if(!lr){ rentHint.textContent = ''; return; }
+      const d = Math.round((v-lr)*100)/100;
+      rentHint.innerHTML = 'ราคาปกติของห้อง '+money(lr)+' บาท'+(rentIn.value!=='' && d!==0 ? ' · <b>'+(d>0?'เพิ่ม ':'ลด ')+money(Math.abs(d))+' บาท จากราคาปกติ</b> (ใช้เป็นค่าเช่าในสัญญาตอนยืนยันเข้าพัก ราคาห้องในระบบไม่เปลี่ยน)' : '');
+    }
+    function rentReset(){ rentIn.value = listRentOf() || ''; rentHintUpdate(); }
+    fillRooms(); rentReset();
+    if(propSel) propSel.addEventListener('change', ()=>{ fillRooms(); rentReset(); });
+    roomSel.addEventListener('change', rentReset);
+    rentIn.addEventListener('input', rentHintUpdate);
   });
 }
 
@@ -3121,6 +3136,18 @@ async function renderSlipPanelAt(sel){
   if(!$(sel)) return;
   slips.sort((x,y)=>(x.notSlip?1:0)-(y.notSlip?1:0));  // images the checker could not read as a slip go last
   if(SlipUi.status==='pending'){ SlipUi.pendingCount = slips.filter(x=>!x.notSlip).length; updateApprovalBadge(); }
+  // images one room sent within 2 minutes (e.g. a LINE multi-photo album) are shown as one batch
+  (function(){
+    const by = {};
+    slips.filter(x=>x.status==='pending').forEach(x=>{ (by[x.roomId]=by[x.roomId]||[]).push(x); });
+    Object.keys(by).forEach(rid=>{
+      const arr = by[rid].slice().sort((x,y)=>String(x.createdAt)<String(y.createdAt)?-1:1);
+      let grp = [];
+      const flush = ()=>{ if(grp.length>1) grp.forEach((x,i)=>{ x._gn = grp.length; x._gi = i+1; x._gid = grp[0].id; x._gall = grp; }); grp = []; };
+      arr.forEach(x=>{ if(grp.length && new Date(x.createdAt)-new Date(grp[grp.length-1].createdAt) > 120000) flush(); grp.push(x); });
+      flush();
+    });
+  })();
   const stPill = {pending:'<span class="pill warn">รอตรวจสอบ</span>', approved:'<span class="pill ok">ยืนยันแล้ว</span>', rejected:'<span class="pill bad">ยกเลิก</span>'};
   host.innerHTML = '<div class="card"><div class="card-head"><div><h3>สลิปรอตรวจสอบ '+(SlipUi.status==='pending' ? '<span class="pill '+(slips.length?'warn':'ok')+'">'+slips.length+'</span>' : '')+'</h3>'+
     '<div class="desc">ลูกบ้านส่งรูปสลิปในกลุ่มห้อง → ระบบบันทึกไว้รอตรวจ · ตรวจยอดเงินที่เข้าบัญชีให้ตรงก่อน แล้วกดยืนยัน ระบบจึงบันทึกรับชำระ ออกใบเสร็จ และแจ้ง "ได้รับชำระเรียบร้อย" เข้ากลุ่มห้อง</div></div>'+
@@ -3129,8 +3156,8 @@ async function renderSlipPanelAt(sel){
       slips.map(sl=>{
         const owed = openInvoicesOf(sl.roomId).reduce((s,x)=>s+x.rem,0);
         return '<tr'+(sl.notSlip?' style="opacity:.6;"':'')+'><td><b>'+escapeHtml(sl.roomCode)+'</b>'+(sl.notSlip?'<div><span class="pill muted">อาจไม่ใช่สลิป</span></div>':'')+'</td><td>'+fmtDateTime(sl.createdAt)+'</td><td class="num">'+(sl.suggestedAmount? money(sl.suggestedAmount):'<span class="pill muted">ไม่ทราบ — ดูจากรูป</span>')+'</td><td class="num">'+money(owed)+'</td>'+
-          '<td style="font-size:12px;">'+((sl.flags||[]).map(f=>'<div style="color:var(--danger);">⚠ '+escapeHtml(f)+'</div>').join('') || '-')+(sl.status==='approved'?'<div>ยืนยัน '+money(sl.approvedAmount)+' โดย '+escapeHtml(sl.approvedByName||'')+' · '+escapeHtml((sl.receipts||[]).join(', '))+'</div>':'')+(sl.status==='rejected'?'<div>'+escapeHtml(sl.rejectReason||'')+' · '+escapeHtml(sl.rejectedByName||'')+'</div>':'')+'</td>'+
-          '<td>'+stPill[sl.status]+'</td><td style="text-align:right;white-space:nowrap;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">อนุมัติ</button> <button class="btn sm" data-slipnot="'+sl.id+'" title="รูปที่ไม่ใช่สลิป — ปิดรายการ โดยไม่ส่งข้อความเข้ากลุ่ม">ไม่ใช่สลิป</button> <button class="btn sm danger" data-slipcancel="'+sl.id+'">ยกเลิก</button>':'')+'</td></tr>';
+          '<td style="font-size:12px;">'+(sl._gn?'<div><span class="pill info" title="ห้องนี้ส่งรูปหลายรูปติดกันภายในไม่กี่วินาที (เช่น ส่งเป็นอัลบั้ม) — แต่ละรูปเป็นข้อความไลน์คนละข้อความ">ส่งพร้อมกัน '+sl._gi+'/'+sl._gn+' รูป</span></div>':'')+((sl.flags||[]).map(f=>'<div style="color:var(--danger);">⚠ '+escapeHtml(f)+'</div>').join('') || '-')+(sl.status==='approved'?'<div>ยืนยัน '+money(sl.approvedAmount)+' โดย '+escapeHtml(sl.approvedByName||'')+' · '+escapeHtml((sl.receipts||[]).join(', '))+'</div>':'')+(sl.status==='rejected'?'<div>'+escapeHtml(sl.rejectReason||'')+' · '+escapeHtml(sl.rejectedByName||'')+'</div>':'')+'</td>'+
+          '<td>'+stPill[sl.status]+'</td><td style="text-align:right;white-space:nowrap;">'+(sl.status==='pending'?'<button class="btn sm primary" data-slip="'+sl.id+'">อนุมัติ</button> <button class="btn sm" data-slipnot="'+sl.id+'" title="รูปที่ไม่ใช่สลิป — ปิดรายการ โดยไม่ส่งข้อความเข้ากลุ่ม">ไม่ใช่สลิป</button> <button class="btn sm danger" data-slipcancel="'+sl.id+'">ยกเลิก</button>'+(sl._gn && sl._gid===sl.id ? '<div style="margin-top:6px;"><button class="btn sm" data-slipgrp="'+sl.id+'" title="ปิดทุกรูปในชุดนี้ว่าไม่ใช่สลิป โดยไม่ส่งข้อความเข้ากลุ่ม">ไม่ใช่สลิปทั้ง '+sl._gn+' รูป</button></div>':''):'')+'</td></tr>';
       }).join('')+'</tbody></table></div>' : '<div class="empty-row" style="padding:18px;">'+(SlipUi.status==='pending'?'ไม่มีสลิปรอตรวจสอบ':'ไม่มีรายการ')+'</div>')+'</div>';
   $('#slipStSel', host).addEventListener('change', e=>{ SlipUi.status = e.target.value; renderSlipPanel(); });
   $all('[data-slip]', host).forEach(b=>b.addEventListener('click', ()=>openSlipReviewModal(slips.find(x=>x.id===b.dataset.slip))));
@@ -3140,6 +3167,17 @@ async function renderSlipPanelAt(sel){
     catch(e){ toast(e.message,'err'); b.disabled = false; }
   }));
   $all('[data-slipcancel]', host).forEach(b=>b.addEventListener('click', ()=>openSlipRejectModal(slips.find(x=>x.id===b.dataset.slipcancel))));
+  $all('[data-slipgrp]', host).forEach(b=>b.addEventListener('click', ()=>{
+    const first = slips.find(x=>x.id===b.dataset.slipgrp); const grp = (first && first._gall) || [];
+    if(grp.length<2) return;
+    confirmModal({title:'ปิดทั้ง '+grp.length+' รูป — ห้อง '+first.roomCode, submitLabel:'ปิดทั้ง '+grp.length+' รูป (ไม่ใช่สลิป)',
+      bodyHtml:'<div class="help-box">ห้อง '+escapeHtml(first.roomCode)+' ส่งรูปมา '+grp.length+' รูปติดกัน ระบบจะปิดทั้งหมดว่า <b>ไม่ใช่สลิป</b> โดย<b>ไม่ส่งข้อความเข้ากลุ่ม</b> และไม่บันทึกรับชำระ ควรเปิดดูรูปก่อนว่าไม่ใช่สลิปจริงๆ (กดอนุมัติแล้วดูรูป ปิดหน้าต่างได้โดยไม่เสียรายการ)</div>',
+      onSubmit: async ()=>{
+        let done = 0;
+        for(const sl of grp){ await lineCall('slip_reject', {slipId: sl.id, reason:'ไม่ใช่สลิปโอนเงิน', notify:false}); done++; await logAudit({action:'DISMISS_NOT_SLIP', entityType:'slip', entityId: sl.id, newValue:{roomCode: sl.roomCode, batch: grp.length}}); }
+        toast('ปิด '+done+' รายการแล้ว (ไม่ส่งข้อความเข้ากลุ่ม)','ok'); renderSlipPanel();
+      }});
+  }));
 }
 async function openSlipReviewModal(sl){
   const open = openInvoicesOf(sl.roomId);
@@ -3162,6 +3200,7 @@ async function openSlipReviewModal(sl){
   }, bodyHtml:
     '<div class="help-box">ตรวจยอดเงินในสลิปให้ตรงกับที่เข้าบัญชีก่อน เมื่อยืนยัน ระบบจะบันทึกรับชำระ ออกเลขที่ใบเสร็จ และส่งข้อความ "ได้รับชำระเงินเรียบร้อย" เข้ากลุ่มห้อง</div>'+
     ((sl.flags||[]).length ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);color:var(--danger);">'+sl.flags.map(f=>'⚠ '+escapeHtml(f)).join('<br>')+'</div>' : '')+
+    (owed<=0 ? '<div class="help-box" style="background:var(--danger-soft);border-color:var(--danger);color:var(--danger);">⚠ ห้องนี้ไม่มียอดค้างชำระแล้ว — ถ้ารูปนี้ไม่ใช่สลิปใหม่ (ซ้ำ/รูปอื่น) ให้ปิดรายการด้วยปุ่ม "ไม่ใช่สลิป" แทนการอนุมัติ ไม่งั้นจะเป็นยอดจ่ายเกิน</div>' : '')+
     '<div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start;">'+
       '<div id="slipImgBox" style="min-height:120px;text-align:center;"><p class="hint">กำลังโหลดรูปสลิป…</p></div>'+
       '<div>'+
