@@ -504,13 +504,29 @@ async function lineCallPreview(action, payload){
   if(!(Number(st.ver)>=5)) throw new Error('ฝั่งเซิร์ฟเวอร์ (km-line) ยังเป็นเวอร์ชันเก่า ยังไม่รองรับการดูข้อความก่อนส่ง — ยังไม่ได้ส่งอะไรเข้ากลุ่ม ต้อง deploy เวอร์ชันใหม่ก่อน');
   return lineCall(action, payload);
 }
-function openSendPreview({title, items, confirmLabel, note, onConfirm, onBack}){
+function openSendPreview({title, items, confirmLabel, note, onConfirm, onBack, onManual}){
   const body = '<div class="help-box"><b>ตรวจข้อความด้านล่างให้ถูกต้องก่อนกดยืนยัน</b> — ข้อความจะถูกส่งเข้ากลุ่มไลน์ตามนี้ทุกตัวอักษร และ LINE ลบข้อความที่ส่งไปแล้วไม่ได้'+(note?'<br>'+note:'')+'</div>'+
     '<div id="pvList" style="max-height:52vh;overflow:auto;">'+items.map((it,k)=>
-      '<div class="field" style="margin-bottom:10px;"><label>'+escapeHtml(it.label)+(it.warn?' <span class="pill bad" style="padding:1px 6px;">'+escapeHtml(it.warn)+'</span>':'')+'</label>'+
+      '<div class="field" style="margin-bottom:10px;"><label>'+escapeHtml(it.label)+(it.warn?' <span class="pill bad" style="padding:1px 6px;">'+escapeHtml(it.warn)+'</span>':'')+' <button type="button" class="btn sm" data-pvcopy="'+k+'" style="margin-left:6px;">คัดลอกข้อความ</button></label>'+
       '<textarea readonly style="width:100%;min-height:'+Math.min(300, 40+ (String(it.text).split('\n').length*20))+'px;font-family:inherit;'+(it.warn?'opacity:.55;':'')+'">'+escapeHtml(it.text)+'</textarea></div>').join('')+'</div>'+
+    (onManual ? '<div class="help-box" id="pvManual" style="margin-top:8px;"><b>ส่งเองจากแอป LINE แทน (ไม่ใช้โควตาบอท)</b><br>กด “คัดลอกข้อความ” ของแต่ละห้อง ไปวางในกลุ่มห้องนั้นด้วยบัญชี LINE ของพนักงาน แล้วกลับมาบันทึกสถานะที่นี่ เพื่อให้ระบบรู้ว่าบิลส่งแล้ว (และแจ้งเตือนค่าห้องวันที่ 5/10 จะทำงานต่อได้)<br>'+
+      '<label style="display:inline-flex;gap:6px;align-items:center;font-weight:400;margin-top:6px;"><input type="checkbox" id="pvManualOk" style="width:auto;"> ยืนยันว่าส่งข้อความข้างต้นในกลุ่มห้องครบแล้ว</label> '+
+      '<button type="button" class="btn sm primary" id="pvManualBtn" disabled style="margin-left:8px;">บันทึกว่าส่งเองแล้ว</button></div>' : '')+
     (onBack ? '<button type="button" class="btn sm" id="pvBack">‹ ย้อนกลับไปแก้ไข</button>' : '');
   const back = openModal({title, wide:true, submitLabel: confirmLabel||'ยืนยันและส่งข้อความนี้', onSubmit: async ()=>{ await onConfirm(); }, bodyHtml: body});
+  $all('[data-pvcopy]', back).forEach(b=>b.addEventListener('click', async ()=>{
+    const txt = String(items[Number(b.dataset.pvcopy)].text);
+    let ok = false;
+    try{ await navigator.clipboard.writeText(txt); ok = true; }catch(e){
+      try{ const ta = document.createElement('textarea'); ta.value = txt; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); ok = document.execCommand('copy'); ta.remove(); }catch(e2){}
+    }
+    toast(ok ? 'คัดลอกข้อความแล้ว — ไปวางในกลุ่มไลน์ได้เลย' : 'คัดลอกอัตโนมัติไม่ได้ — ลากคลุมข้อความในช่องแล้วกด Ctrl+C', ok?'ok':'warn');
+  }));
+  if(onManual){
+    const okc = $('#pvManualOk', back), mb = $('#pvManualBtn', back);
+    okc.addEventListener('change', ()=>{ mb.disabled = !okc.checked; });
+    mb.addEventListener('click', async ()=>{ mb.disabled = true; try{ await onManual(); back.remove(); }catch(e){ toast(e.message,'err'); mb.disabled = !okc.checked; } });
+  }
   const bb = $('#pvBack', back); if(bb) bb.addEventListener('click', ()=>{ back.remove(); onBack(); });
   return back;
 }
@@ -2589,7 +2605,7 @@ function renderInvoices(root){
     const elecInclusive = (i.elecMode||i.billingMode)==='INCLUSIVE';
     const waterFlat = i.waterMode==='FLAT';
     return '<tr><td class="mono">'+(i.invoiceNumber||'-')+(i.replacesInvoiceId?'<div class="footnote">แทนใบเดิม</div>':'')+(i.moveOutId?'<div class="footnote">หักจากเงินมัดจำ (ย้ายออก)</div>':'')+
-      (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+
+      (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? (i.lineBillSentManual?'ส่งเองในไลน์แล้ว ':'ส่งเข้ากลุ่มแล้ว ')+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+
       (i.status==='cancelled' && i.lineBillSentAt ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineCancelNotifiedAt ? 'แจ้งยกเลิกเข้ากลุ่มแล้ว '+fmtDateTime(i.lineCancelNotifiedAt) : 'ยังไม่ได้แจ้งยกเลิกเข้ากลุ่ม')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
       '<td class="num">'+money(i.rentAmount)+(i.prepayMonths>1?'<div class="footnote">ล่วงหน้า '+i.prepayMonths+' เดือน ถึง '+periodLabel(i.prepayTo)+'</div>':'')+(i.prepaidBy?'<div class="footnote">ชำระล่วงหน้าแล้ว'+(i.prepaidByNumber?' ('+escapeHtml(i.prepaidByNumber)+')':'')+'</div>':'')+'</td>'+
       '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(i.utilSkipped && !waterFlat)?'<span class="pill muted" style="padding:1px 6px;" title="ผู้เช่าเข้าใหม่ — ไม่คิดค่าน้ำ-ไฟเดือนแรก">ไม่คิด (เดือนแรก)</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':(i.waterMinApplied?' <span class="pill muted" style="padding:1px 6px;" title="ใช้น้ำไม่ถึงหน่วยที่รวมในค่าขั้นต่ำ — คิดขั้นต่ำ">ขั้นต่ำ</span>':''))))+'</td>'+
@@ -2676,6 +2692,12 @@ async function openSendBillsModal({period, onlyId}){
       note: previews.length!==sendable.length ? 'ห้องที่ยังไม่ผูกกลุ่มไลน์จะไม่ถูกส่ง (ติดป้ายไว้)' : '',
       items: previews.map(p=>({label:'ห้อง '+p.roomCode, text:p.text, warn: p.hasGroup?'':'ยังไม่มีกลุ่ม — ไม่ส่ง'})),
       onBack: ()=>openSendBillsModal({period, onlyId}),
+      onManual: async ()=>{
+        const now = nowIso();
+        for(const p of previews){ await Store.update('invoices', p.id, {lineBillSentAt: now, lineBillSentManual: true, lineBillSentBy: Session.user.name}); }
+        try{ await logAudit({action:'MARK_BILLS_SENT_MANUAL', entityType:'invoice', entityId:previews[0].id, newValue:{rooms:previews.map(p=>p.roomCode), count:previews.length}}); }catch(e){}
+        toast('บันทึกแล้วว่าส่งบิลเองในไลน์ '+previews.length+' ห้อง','ok');
+      },
       onConfirm: async ()=>{
         if(!sendable.length) throw new Error('ไม่มีห้องที่ผูกกลุ่มไลน์');
         const sent=[], noGroup=[], failed=[];
