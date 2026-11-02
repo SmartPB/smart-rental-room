@@ -900,6 +900,8 @@ function periodAdd(p, n){ let q=p; for(let i=0;i<n;i++) q=nextPeriod(q); return 
 function prepayCoverFor(roomId, period){
   return cache.invoices.find(i=>i.roomId===roomId && i.prepayMonths>1 && i.status!=='cancelled' && i.status!=='waived' && i.period<period && period<=i.prepayTo) || null;
 }
+/* A tenant whose lease starts in the billed month (or later) was not there during the meter month, so the first bill carries no metered water/electricity */
+function firstMonthNoUtil(lease, period){ return !!(lease && lease.startDate && periodOfDate(lease.startDate) >= period); }
 async function generateInvoice({roomId, roomCode, period, discount, discountReason, prepayMonths}){
   const n = Math.min(12, Math.max(1, Math.floor(Number(prepayMonths||1))));
   for(let k=0;k<n;k++){ const pk = periodAdd(period,k);
@@ -912,11 +914,12 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   const lease = activeLeaseFor(roomId);
   const rent1 = lease? lease.rent : room.rent;
   const readPeriod = prevPeriod(period);   // meters read at the end of the previous month are billed with this month's rent
-  const water = readingFor(roomId,'water',readPeriod);
-  const elec = readingFor(roomId,'elec',readPeriod);
+  const skipUtil = firstMonthNoUtil(lease, period);
+  const water = skipUtil ? null : readingFor(roomId,'water',readPeriod);
+  const elec = skipUtil ? null : readingFor(roomId,'elec',readPeriod);
   const cfg = cache.config;
-  if(roomWaterMode(room)==='SEPARATE' && !water) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์น้ำเดือน '+periodLabel(readPeriod)+' (สำหรับค่าเช่าเดือน '+periodLabel(period)+') — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
-  if(roomElecMode(room)==='SEPARATE' && !elec) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์ไฟเดือน '+periodLabel(readPeriod)+' (สำหรับค่าเช่าเดือน '+periodLabel(period)+') — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
+  if(!skipUtil && roomWaterMode(room)==='SEPARATE' && !water) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์น้ำเดือน '+periodLabel(readPeriod)+' (สำหรับค่าเช่าเดือน '+periodLabel(period)+') — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
+  if(!skipUtil && roomElecMode(room)==='SEPARATE' && !elec) throw new Error('ห้อง '+roomCode+' ยังไม่ได้จดมิเตอร์ไฟเดือน '+periodLabel(readPeriod)+' (สำหรับค่าเช่าเดือน '+periodLabel(period)+') — ต้องจดมิเตอร์ก่อนออกใบแจ้งหนี้');
   const waterMode = roomWaterMode(room);
   const elecMode = roomElecMode(room);
   let waterAmount = 0, waterMinApplied = false;
@@ -941,9 +944,9 @@ async function generateInvoice({roomId, roomCode, period, discount, discountReas
   const invSeq = await nextInvoiceSeq(room.propertyId, prop.code, period);
   const invId = await Store.add('invoices', {
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: room.propertyId, propertyCode: prop.code,
-    roomId, roomCode, period, readingPeriod: readPeriod, waterMode, elecMode, rentAmount:rent,
+    roomId, roomCode, period, readingPeriod: skipUtil ? '' : readPeriod, utilSkipped: skipUtil && (waterMode==='SEPARATE' || elecMode==='SEPARATE'), waterMode, elecMode, rentAmount:rent,
     prepayMonths: n>1? n : 0, prepayTo: n>1? periodAdd(period,n-1) : '', prepaidBy: prepaid? cover.id : '', prepaidByNumber: prepaid? (cover.invoiceNumber||'') : '',
-    waterUnits: water?water.usage:0, waterAmount, waterMinFee: waterMode==='SEPARATE' ? roomWaterMinFee(room) : 0, waterMinApplied, elecUnits: elec?elec.usage:0, elecAmount, commonFee,
+    waterUnits: water?water.usage:0, waterAmount, waterMinFee: (waterMode==='SEPARATE' && !skipUtil) ? roomWaterMinFee(room) : 0, waterMinApplied, elecUnits: elec?elec.usage:0, elecAmount, commonFee,
     discount, discountReason: discountReason||'', discountState, discountApprovedBy: discountState==='approved'? Session.user.name : '',
     total, status: discountState==='pending' ? 'pending_discount' : 'unpaid',
     createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
@@ -991,16 +994,21 @@ async function reissueInvoice(oldInvoice){
   // a re-issued bill takes today's contract rent and common fee (the usual reason for re-issuing is a wrong amount); meter-based water/electric stay as billed
   const leaseNow = activeLeaseFor(oldInvoice.roomId);
   const nMonths = oldInvoice.prepayMonths>1 ? oldInvoice.prepayMonths : 1;
+  // a tenant who moved in during the billed month carries no metered water/electricity on the first bill (those readings were the previous tenant's)
+  const skipU = !!oldInvoice.utilSkipped || firstMonthNoUtil(leaseNow, oldInvoice.period);
+  const wFlat = oldInvoice.waterMode==='FLAT';
+  const wUnits = skipU ? 0 : oldInvoice.waterUnits, wAmt = skipU ? (wFlat ? oldInvoice.waterAmount : 0) : oldInvoice.waterAmount;
+  const eUnits = skipU ? 0 : oldInvoice.elecUnits, eAmt = skipU ? 0 : oldInvoice.elecAmount;
   const rentNew = oldInvoice.prepaidBy ? 0 : r2(Number(leaseNow ? leaseNow.rent : (room ? room.rent : oldInvoice.rentAmount)) * nMonths);
   const commonNew = oldInvoice.prepaidBy ? 0 : r2(Number(room ? (room.commonFee||0) : (oldInvoice.commonFee||0)) * nMonths);
   const newId = await Store.add('invoices', {
     invoiceNumber: invSeq.label, invoiceSeq: invSeq.seq, propertyId: oldInvoice.propertyId, propertyCode: prop.code,
     roomId: oldInvoice.roomId, roomCode: oldInvoice.roomCode, period: oldInvoice.period, waterMode: oldInvoice.waterMode, elecMode: oldInvoice.elecMode,
     prepayMonths: oldInvoice.prepayMonths||0, prepayTo: oldInvoice.prepayTo||'', prepaidBy: oldInvoice.prepaidBy||'', prepaidByNumber: oldInvoice.prepaidByNumber||'',
-    rentAmount: rentNew, waterUnits: oldInvoice.waterUnits, waterAmount: oldInvoice.waterAmount, waterMinFee: oldInvoice.waterMinFee||0, waterMinApplied: !!oldInvoice.waterMinApplied,
-    elecUnits: oldInvoice.elecUnits, elecAmount: oldInvoice.elecAmount, commonFee: commonNew,
+    rentAmount: rentNew, waterUnits: wUnits, waterAmount: wAmt, waterMinFee: skipU ? 0 : (oldInvoice.waterMinFee||0), waterMinApplied: skipU ? false : !!oldInvoice.waterMinApplied,
+    elecUnits: eUnits, elecAmount: eAmt, commonFee: commonNew, utilSkipped: skipU && (oldInvoice.waterMode==='SEPARATE' || oldInvoice.elecMode==='SEPARATE'),
     discount:0, discountReason:'', discountState:'none', discountApprovedBy:'',
-    total: rentNew+oldInvoice.waterAmount+oldInvoice.elecAmount+commonNew,
+    total: r2(rentNew+wAmt+eAmt+commonNew),
     status:'unpaid', createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
     replacesInvoiceId: oldInvoice.id, replacedByInvoiceId:''
   });
@@ -2584,8 +2592,8 @@ function renderInvoices(root){
       (i.status!=='cancelled' && i.status!=='waived' ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineBillSentAt ? 'ส่งเข้ากลุ่มแล้ว '+fmtDateTime(i.lineBillSentAt) : 'ยังไม่ส่งเข้ากลุ่มห้อง')+'</div>' : '')+
       (i.status==='cancelled' && i.lineBillSentAt ? '<div class="footnote" style="margin:2px 0 0;">'+(i.lineCancelNotifiedAt ? 'แจ้งยกเลิกเข้ากลุ่มแล้ว '+fmtDateTime(i.lineCancelNotifiedAt) : 'ยังไม่ได้แจ้งยกเลิกเข้ากลุ่ม')+'</div>' : '')+'</td><td><strong>'+i.roomCode+'</strong></td><td>'+periodLabel(i.period)+'</td>'+
       '<td class="num">'+money(i.rentAmount)+(i.prepayMonths>1?'<div class="footnote">ล่วงหน้า '+i.prepayMonths+' เดือน ถึง '+periodLabel(i.prepayTo)+'</div>':'')+(i.prepaidBy?'<div class="footnote">ชำระล่วงหน้าแล้ว'+(i.prepaidByNumber?' ('+escapeHtml(i.prepaidByNumber)+')':'')+'</div>':'')+'</td>'+
-      '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':(i.waterMinApplied?' <span class="pill muted" style="padding:1px 6px;" title="ใช้น้ำไม่ถึงหน่วยที่รวมในค่าขั้นต่ำ — คิดขั้นต่ำ">ขั้นต่ำ</span>':''))))+'</td>'+
-      '<td class="num">'+(elecInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':money(i.elecAmount))+'</td>'+
+      '<td class="num">'+(waterInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(i.utilSkipped && !waterFlat)?'<span class="pill muted" style="padding:1px 6px;" title="ผู้เช่าเข้าใหม่ — ไม่คิดค่าน้ำ-ไฟเดือนแรก">ไม่คิด (เดือนแรก)</span>':(money(i.waterAmount)+(waterFlat?' <span class="pill muted" style="padding:1px 6px;">เหมาจ่าย</span>':(i.waterMinApplied?' <span class="pill muted" style="padding:1px 6px;" title="ใช้น้ำไม่ถึงหน่วยที่รวมในค่าขั้นต่ำ — คิดขั้นต่ำ">ขั้นต่ำ</span>':''))))+'</td>'+
+      '<td class="num">'+(elecInclusive?'<span class="pill muted" style="padding:1px 6px;">รวมค่าเช่า</span>':(i.utilSkipped && (i.elecMode||i.billingMode)==='SEPARATE')?'<span class="pill muted" style="padding:1px 6px;" title="ผู้เช่าเข้าใหม่ — ไม่คิดค่าน้ำ-ไฟเดือนแรก">ไม่คิด (เดือนแรก)</span>':money(i.elecAmount))+'</td>'+
       '<td class="num">'+money(i.commonFee||0)+'</td>'+
       '<td class="num">'+(i.discount>0?'-'+money(i.discount):'-')+'</td><td class="num"><strong>'+money(i.total)+'</strong></td>'+
       '<td><span class="pill '+stMap[i.status]+'">'+INVOICE_STATUS_LABEL[i.status]+'</span></td>'+
@@ -2743,8 +2751,9 @@ const lm = n=>{ n=Number(n||0); return n.toLocaleString('en-US',{minimumFraction
 function invoiceBreakdown(i){
   const wMode = i.waterMode||i.billingMode, eMode = i.elecMode||i.billingMode;
   const parts = [i.prepaidBy ? 'ค่าเช่า ชำระล่วงหน้าแล้ว' : (i.prepayMonths>1 ? 'เช่า '+i.prepayMonths+' เดือน ('+periodLabel(i.period)+' – '+periodLabel(i.prepayTo)+') '+lm(i.rentAmount) : 'เช่า '+lm(i.rentAmount))];
-  if(wMode!=='INCLUSIVE') parts.push('น้ำ '+lm(i.waterAmount)+(i.waterMode==='FLAT'?' (เหมา)':(i.waterUnits && !(Number(i.waterMinFee)>0 && Number(i.waterAmount)<=Number(i.waterMinFee)) ? ' ('+lm(i.waterUnits)+' หน่วย)':'')));
-  if(eMode!=='INCLUSIVE') parts.push('ไฟ '+lm(i.elecAmount)+(i.elecUnits? ' ('+lm(i.elecUnits)+' หน่วย)':''));
+  if(i.utilSkipped){ if(wMode==='FLAT') parts.push('น้ำ '+lm(i.waterAmount)+' (เหมา)'); parts.push('ค่าน้ำ-ไฟ ไม่คิดเดือนแรก'); }
+  else if(wMode!=='INCLUSIVE') parts.push('น้ำ '+lm(i.waterAmount)+(i.waterMode==='FLAT'?' (เหมา)':(i.waterUnits && !(Number(i.waterMinFee)>0 && Number(i.waterAmount)<=Number(i.waterMinFee)) ? ' ('+lm(i.waterUnits)+' หน่วย)':'')));
+  if(!i.utilSkipped && eMode!=='INCLUSIVE') parts.push('ไฟ '+lm(i.elecAmount)+(i.elecUnits? ' ('+lm(i.elecUnits)+' หน่วย)':''));
   if(Number(i.commonFee||0)>0) parts.push('ส่วนกลาง '+lm(i.commonFee));
   if(Number(i.discount||0)>0) parts.push('ส่วนลด -'+lm(i.discount));
   return parts;
