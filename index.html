@@ -789,7 +789,7 @@ async function deleteRoom(room){
 }
 
 /* ---- room bookings / reservations ---- */
-async function createReservation({roomId, tenantName, phone, moveInDate, depositAmount, rent, note, depositSlipDataUrl}){
+async function createReservation({roomId, tenantName, phone, address, moveInDate, depositAmount, rent, note, depositSlipDataUrl}){
   const room = roomById(roomId);
   if(!room) throw new Error('กรุณาเลือกห้องที่ว่าง');
   if(room.status!=='VACANT') throw new Error('จองล่วงหน้าได้เฉพาะห้องว่างเท่านั้น');
@@ -805,7 +805,7 @@ async function createReservation({roomId, tenantName, phone, moveInDate, deposit
   const prop = propertyById(room.propertyId);
   const id = await Store.add('reservations', {
     propertyId: room.propertyId, propertyCode: prop? prop.code:'', roomId, roomCode: room.code,
-    tenantName: tenantName.trim(), phone:phone.trim(), moveInDate, depositAmount: dep, rent: agreed, listRent: Number(room.rent||0),
+    tenantName: tenantName.trim(), phone:phone.trim(), address:(address||'').trim(), moveInDate, depositAmount: dep, rent: agreed, listRent: Number(room.rent||0),
     depositSlipDataUrl, note:(note||'').trim(), status:'PENDING', createdBy: Session.user.id, createdByName: Session.user.name, createdAt: nowIso()
   });
   await Store.update('rooms', roomId, {status:'RESERVED'});
@@ -834,12 +834,16 @@ async function updateRoomStatus(room, status){
 }
 async function createTenantAndLease(data){
   const tenantId = await Store.add('tenants', {name:data.name, phone:data.phone, address:data.address||'',
-    idCardPhotoUrl:data.idCardPhotoUrl||'', active:true, createdAt: nowIso()});
+    idCardPhotoUrl: STORE_ID_PHOTO ? (data.idCardPhotoUrl||'') : '', active:true, createdAt: nowIso()});
   const leaseId = await Store.add('leases', {
     roomId:data.roomId, roomCode:data.roomCode, tenantId, tenantName:data.name, rent:data.rent, deposit: data.deposit!=null? Number(data.deposit): Number(data.rent||0),
     startDate:data.startDate, termMonths: data.termMonths>0? Number(data.termMonths): null, termEndDate: data.termMonths>0? leaseTermEnd(data.startDate, data.termMonths): '', endDate:null, active:true, contractPhotoUrl:data.contractPhotoUrl||'', createdAt: nowIso()
   });
   await Store.update('rooms', data.roomId, {status:'OCCUPIED'});
+  if(data.meterStart){
+    try{ await recordMoveInBaselines(roomById(data.roomId), data.startDate, data.meterStart); }
+    catch(e){ toast('ผูกสัญญาแล้ว แต่บันทึกเลขมิเตอร์เริ่มต้นไม่สำเร็จ: '+((e&&e.message)||e)+' — บันทึกซ้ำได้ที่หน้ามิเตอร์','warn'); }
+  }
   await logAudit({action:'CREATE_LEASE', entityType:'lease', entityId:leaseId,
     newValue:{roomCode:data.roomCode, name:data.name, phone:data.phone, address:data.address, rent:data.rent, startDate:data.startDate}});
   toast('ผูกสัญญาผู้เช่าเข้าห้อง '+data.roomCode+' แล้ว','ok');
@@ -1230,7 +1234,7 @@ function computeInvoiceGaps(){
 }
 
 function usageStatsFor(roomId, type, period){
-  const all = cache.meterReadings.filter(r=>r.roomId===roomId && r.type===type && r.period<=period).sort((a,b)=> a.period<b.period?1:-1);
+  const all = cache.meterReadings.filter(r=>r.roomId===roomId && r.type===type && r.period<=period && !r.baseline).sort((a,b)=> a.period<b.period?1:-1);
   const cur = all.find(r=>r.period===period);
   if(!cur) return null;
   const history = all.filter(r=>r.period<period);
@@ -1588,6 +1592,249 @@ async function fileToCompressedDataUrl(file){
 }
 
 /* ============================================================
+   ID-CARD SCAN (OCR in this browser — picture never uploaded, never stored) · AI METER READ · MOVE-IN METER BASELINE
+   ============================================================ */
+const STORE_ID_PHOTO = false;   // true = also keep the ID-card picture on the tenant record (old behaviour). Default: only name + address are kept.
+let _tessP = null;
+function loadTesseract(){
+  if(window.Tesseract) return Promise.resolve(window.Tesseract);
+  if(_tessP) return _tessP;
+  _tessP = new Promise((res,rej)=>{
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.2/tesseract.min.js';
+    sc.onload = ()=> window.Tesseract ? res(window.Tesseract) : (_tessP=null, rej(new Error('โหลดตัวอ่านบัตรไม่สำเร็จ')));
+    sc.onerror = ()=>{ _tessP = null; rej(new Error('โหลดตัวอ่านบัตรไม่ได้ — ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่ หรือกรอกเอง')); };
+    document.head.appendChild(sc);
+  });
+  return _tessP;
+}
+/* grayscale + contrast stretch + upscale so small ID-card print is readable */
+function prepareForOcr(file){
+  return new Promise((resolve,reject)=>{
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = ()=>{
+      try{
+        const target = 1800, scale = Math.min(2.5, target/Math.max(img.width,1));
+        const w = Math.max(1, Math.round(img.width*scale)), h = Math.max(1, Math.round(img.height*scale));
+        const c = document.createElement('canvas'); c.width = w; c.height = h;
+        const g = c.getContext('2d'); g.drawImage(img,0,0,w,h);
+        const d = g.getImageData(0,0,w,h), px = d.data; let lo = 255, hi = 0;
+        for(let i=0;i<px.length;i+=4){ const y = (px[i]*0.299+px[i+1]*0.587+px[i+2]*0.114)|0; px[i]=px[i+1]=px[i+2]=y; if(y<lo)lo=y; if(y>hi)hi=y; }
+        const span = Math.max(1, hi-lo);
+        for(let i=0;i<px.length;i+=4){ const y = Math.max(0, Math.min(255, ((px[i]-lo)*255/span)|0)); px[i]=px[i+1]=px[i+2]=y; }
+        g.putImageData(d,0,0); URL.revokeObjectURL(url); resolve(c);
+      }catch(e){ URL.revokeObjectURL(url); reject(e); }
+    };
+    img.onerror = ()=>{ URL.revokeObjectURL(url); reject(new Error('เปิดไฟล์รูปไม่ได้')); };
+    img.src = url;
+  });
+}
+async function ocrIdCardFile(file, onProgress){
+  const T = await loadTesseract();
+  const canvas = await prepareForOcr(file);
+  const worker = await T.createWorker('tha+eng', 1, { logger: m=>{ if(onProgress && m && m.status==='recognizing text') onProgress(Math.round((m.progress||0)*100)); } });
+  try{ const r = await worker.recognize(canvas); return ocrDataToText(r && r.data); }
+  finally{ try{ await worker.terminate(); }catch(e){} }
+}
+/* Tesseract's plain text for Thai is glyph-spaced ("ช ื ่ อ"), so rebuild each line from word boxes: add a space only where the gap between words is wide. */
+function ocrDataToText(data){
+  if(!data) return '';
+  const lines = Array.isArray(data.lines) ? data.lines : [];
+  const out = [];
+  for(const l of lines){
+    const ws = (l.words||[]).filter(w=>w && w.text && String(w.text).trim() && w.bbox);
+    if(!ws.length) continue;
+    const bb = l.bbox || {y0:ws[0].bbox.y0, y1:ws[0].bbox.y1};
+    const h = Math.max(1, bb.y1-bb.y0);
+    let s = '';
+    ws.forEach((w,i)=>{ if(i>0 && (w.bbox.x0 - ws[i-1].bbox.x1) > h*0.35) s += ' '; s += String(w.text).trim(); });
+    out.push(s);
+  }
+  return out.length ? out.join('\n') : String(data.text||'');
+}
+/* pull name + address out of the OCR text of the FRONT of a Thai ID card (the ID number / birth date / religion are deliberately ignored) */
+function parseThaiIdCard(raw){
+  const TH = '[\\u0E00-\\u0E7F]';
+  const norm = s => String(s||'').normalize('NFC').replace(/ํา/g,'ำ');
+  // "skeleton": no whitespace, no tone/diacritic marks (OCR drops or moves them) — used only to LOCATE labels; text is cut from the original
+  const skel = s => { let sk = '', map = []; for(let i=0;i<s.length;i++){ const c = s[i]; if(/\s/.test(c) || /[็-๎]/.test(c)) continue; sk += c; map.push(i); } return {sk, map}; };
+  const sk0 = w => skel(w).sk;
+  const find = (line, label) => { const k = skel(line), t = sk0(label), at = k.sk.indexOf(t); if(at<0) return null; let end = k.map[at+t.length-1]+1; while(end<line.length && /[\u0E47-\u0E4E]/.test(line[end])) end++; return { start:k.map[at], end }; };
+  const has = (line, label) => skel(line).sk.indexOf(sk0(label)) >= 0;
+  const lines = norm(raw).replace(/\r/g,'').split('\n').map(s=>s.replace(/[|_~`]+/g,' ').replace(/\s+/g,' ').trim()).filter(Boolean);
+  // Word-box text keeps real spaces between words; plain OCR text is glyph-spaced ("ส ม ชา ย"). Only close the gaps when most pieces are 1–2 characters long.
+  const glue = s => {
+    const toks = s.split(' ').filter(Boolean), th = toks.filter(t=>new RegExp(TH).test(t));
+    const marks = s.replace(new RegExp('\\s+(?=[\\u0E31\\u0E33-\\u0E3A\\u0E47-\\u0E4E])','g'),'');
+    if(th.length < 3 || th.filter(t=>t.length<=2).length/th.length <= 0.5) return marks;
+    return marks.replace(new RegExp('('+TH+')\\s+(?='+TH+')','g'),'$1');
+  };
+  const titleRe = /(นางสาว|นาง|นาย|น\.ส\.|เด็กชาย|เด็กหญิง|ด\.ช\.|ด\.ญ\.)/;
+  // --- name: text after "ชื่อตัวและชื่อสกุล"
+  let name = '';
+  for(let i=0;i<lines.length && !name;i++){
+    const m = find(lines[i], 'ชื่อตัวและชื่อสกุล') || find(lines[i], 'ชื่อสกุล');
+    if(m){ name = lines[i].slice(m.end).trim(); if(!name && lines[i+1]) name = lines[i+1]; }
+  }
+  if(!name){ const l = lines.find(s=>new RegExp('^'+titleRe.source).test(s) && !/Mr|Mrs|Miss|Name/i.test(s)); if(l) name = l; }
+  name = name.replace(/\s+(Name|Last\s*name|Mr\.?|Mrs\.?|Miss).*$/i,'').replace(/[^฀-๿ .\-A-Za-z]/g,'').replace(/\s+/g,' ').trim();
+  name = glue(name); { const tm = name.match(/^(นางสาว|นาง|นาย|เด็กชาย|เด็กหญิง)/); if(tm && name.length>tm[0].length && name[tm[0].length]!==' ') name = tm[0]+' '+name.slice(tm[0].length); }   // keep a space after the title
+  // --- address: from "ที่อยู่" until the card-issue / expiry footer
+  let address = '';
+  const stopped = s => has(s,'วันออกบัตร') || has(s,'วันบัตรหมดอายุ') || has(s,'เจ้าพนักงาน') || /Date\s*of\s*(Issue|Expiry)|Expiry/i.test(s) || has(s,'หมดอายุ') || has(s,'ออกบัตร') || /^\d{1,2}\s*[ก-ฮ]\.?\s*[ก-ฮ]\.?\s*\d{4}/.test(s);
+  let ai = -1, am = null;
+  for(let i=0;i<lines.length;i++){ am = find(lines[i],'ที่อยู่'); if(am){ ai = i; break; } }
+  if(ai>=0){
+    const parts = [];
+    const first = lines[ai].slice(am.end).replace(/^[\s\u0E47-\u0E4E]+/,'').trim();
+    if(first) parts.push(first);
+    for(let j=ai+1;j<lines.length && parts.length<4;j++){ if(stopped(lines[j])) break; parts.push(lines[j]); }
+    address = parts.map(x=>glue(x.replace(/[^฀-๿0-9A-Za-z /.,\-]/g,' ').replace(/\s+/g,' ').trim())).join(' ');   // glue OCR gaps inside a line; line breaks become single spaces
+  }
+  address = address.replace(/\s+/g,' ');
+  address = address.replace(/หมู่\s*ที่?(?![฀-๿])/g,'หมู่ที่')
+                   .replace(/(\S)(?=(หมู่ที่|หมู่(?!บ้าน)|ตำบล|แขวง|อำเภอ|เขต|จังหวัด|ซอย|ถนน|ตรอก))/g,'$1 ')
+                   .replace(/(\S)(?=(ต\.|อ\.|จ\.|ม\.|ซ\.|ถ\.))/g,'$1 ')
+                   .replace(/(หมู่ที่|หมู่|ตำบล|แขวง|อำเภอ|เขต|จังหวัด|ซอย|ถนน|ตรอก)(?=\d)/g,'$1 ')
+                   .replace(/\s+/g,' ').trim();
+  return { name, address };
+}
+/* HTML for the optional "scan ID card" block + wiring. Fills the name/address inputs (still editable); nothing is uploaded or stored. */
+function idScanHtml(){
+  return '<div class="field" data-idscan-box><label>อ่านบัตรประชาชนอัตโนมัติ (ไม่บังคับ)</label>'+
+    '<input type="file" accept="image/*" capture="environment" data-idscan>'+
+    '<p class="hint" data-idscan-status>'+icon('camera')+' ถ่ายหน้าบัตรให้ตรง แสงพอ ไม่มีแสงสะท้อน — ระบบอ่านเฉพาะ<b>ชื่อและที่อยู่</b>ในเครื่องนี้ <b>ไม่อัปโหลดและไม่เก็บรูปบัตร</b> แล้วเติมให้ในช่องด้านล่าง ตรวจแก้ก่อนบันทึกทุกครั้ง หรือจะกรอกเองก็ได้</p></div>';
+}
+function wireIdScan(modalEl, nameSel, addrSel){
+  const inp = $('[data-idscan]', modalEl), st = $('[data-idscan-status]', modalEl);
+  if(!inp) return null;
+  const holder = { file:null };
+  inp.addEventListener('change', async ()=>{
+    const f = inp.files && inp.files[0]; holder.file = f || null;
+    if(!f) return;
+    st.style.color = ''; st.textContent = 'กำลังเตรียมตัวอ่านบัตร… (ครั้งแรกอาจใช้เวลาโหลดสักครู่)';
+    try{
+      const text = await ocrIdCardFile(f, p=>{ st.textContent = 'กำลังอ่านบัตร… '+p+'%'; });
+      const r = parseThaiIdCard(text);
+      const nEl = nameSel ? $(nameSel, modalEl) : null, aEl = addrSel ? $(addrSel, modalEl) : null;
+      if(r.name && nEl) nEl.value = r.name;
+      if(r.address && aEl) aEl.value = r.address;
+      const got = [r.name?'ชื่อ':'', (r.address && aEl)?'ที่อยู่':''].filter(Boolean);
+      if(got.length){ st.style.color = 'var(--success, #15803d)'; st.textContent = 'อ่านได้: '+got.join(' + ')+' — กรุณาตรวจและแก้ไขให้ถูกต้องก่อนบันทึก'+(!r.name?' · อ่านชื่อไม่ได้ กรอกเอง':'')+((aEl && !r.address)?' · อ่านที่อยู่ไม่ได้ กรอกเอง':''); }
+      else { st.style.color = 'var(--danger)'; st.textContent = 'อ่านบัตรไม่สำเร็จ — ถ่ายใหม่ให้ชัดขึ้น หรือกรอกเอง'; }
+    }catch(e){ st.style.color = 'var(--danger)'; st.textContent = (e && e.message) || 'อ่านบัตรไม่สำเร็จ — กรอกเอง'; }
+  });
+  return holder;
+}
+
+/* ---- AI meter reading (km-vision edge function; Anthropic key lives server-side only) ---- */
+async function visionCall(payload){
+  const { data:{ session } } = await sb.auth.getSession();
+  if(!session) throw new Error('หมดเวลาเข้าสู่ระบบ กรุณาเข้าสู่ระบบใหม่');
+  let res, j = {};
+  try{
+    res = await fetch(SUPABASE_URL+'/functions/v1/km-vision', { method:'POST',
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+session.access_token, 'apikey':SUPABASE_KEY }, body: JSON.stringify(payload) });
+    j = await res.json().catch(()=>({}));
+  }catch(e){ throw new Error('เชื่อมต่ออินเทอร์เน็ตไม่ได้ กรุณาลองใหม่'); }
+  if(res.status===404) throw new Error('ยังไม่ได้เปิดใช้ตัวอ่านมิเตอร์ AI บนเซิร์ฟเวอร์ — กรอกเลขเอง');
+  if(!res.ok || j.error) throw new Error(j.error || ('เกิดข้อผิดพลาด ('+res.status+')'));
+  return j;
+}
+async function aiReadMeter(file, type){
+  const image = await compressImage(file, 1280, 0.82);
+  const j = await visionCall({ action:'meter', type, image });
+  return j;   // { value, digits, confidence, note }
+}
+/* "read from photo" button wiring shared by the move-in form and the monthly meter form */
+function wireMeterAi({fileInput, valueInput, btnHost, type, label}){
+  if(!fileInput || !valueInput || !btnHost) return;
+  fileInput.addEventListener('change', ()=>{
+    btnHost.innerHTML = '';
+    const f = fileInput.files && fileInput.files[0]; if(!f) return;
+    const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'btn sm';
+    const lab = icon('sparkle')+' อ่านเลข'+(label||'')+'จากรูป (AI)'; btn.innerHTML = lab; btnHost.appendChild(btn);
+    const note = document.createElement('div'); note.className = 'hint'; btnHost.appendChild(note);
+    btn.addEventListener('click', async ()=>{
+      btn.disabled = true; btn.textContent = 'กำลังอ่านตัวเลข…'; note.textContent = '';
+      try{
+        const r = await aiReadMeter(f, type);
+        if(r.value!=null && !isNaN(Number(r.value))){
+          valueInput.value = type==='water' ? Math.round(Number(r.value)) : Math.round(Number(r.value)*10)/10;
+          valueInput.dispatchEvent(new Event('input',{bubbles:true}));
+          note.style.color = r.confidence==='high' ? '' : 'var(--danger)';
+          note.textContent = 'AI อ่านได้ '+valueInput.value+(r.confidence?' (ความมั่นใจ: '+({high:'สูง',medium:'ปานกลาง',low:'ต่ำ'}[r.confidence]||r.confidence)+')':'')+' — เทียบกับรูปแล้วแก้ให้ตรงก่อนบันทึก'+(r.note?' · '+r.note:'');
+        } else { note.style.color = 'var(--danger)'; note.textContent = 'AI อ่านเลขจากรูปไม่ได้'+(r.note?' ('+r.note+')':'')+' — กรอกเอง'; }
+      }catch(e){ note.style.color = 'var(--danger)'; note.textContent = (e && e.message) || 'อ่านไม่สำเร็จ — กรอกเอง'; }
+      finally{ if(document.body.contains(btn)){ btn.disabled = false; btn.innerHTML = lab; } }
+    });
+  });
+}
+
+/* ---- opening meter reading on move-in day ----
+   Stored as a meterReadings doc with baseline:true, moveIn:true and period = (month before the start month) + 'B'.
+   That sorts AFTER the previous month-end reading and BEFORE the first month-end reading of the new tenant, so
+   "previous reading" for the first month-end reading = this opening value; it never collides with a real period (server lookups are exact-match). */
+function moveInBaselinePeriod(startDate){ return prevPeriod(periodOfDate(startDate))+'B'; }
+function meterStartBlockHtml(room, startDate){
+  const types = ['water','elec'].filter(t=>meterRequired(room,t));
+  if(!types.length) return '<div class="field"><label>มิเตอร์เริ่มต้นวันเข้าพัก</label><p class="hint">ห้องนี้ไม่คิดค่าน้ำ-ค่าไฟแยกมิเตอร์ — ไม่ต้องจด</p></div>';
+  const row = t=>{
+    const last = latestReadingFor(room.id, t, '999999');
+    return '<div class="meter-type-block" data-mstart="'+t+'"><div class="meter-type-name">'+METER_TYPE_LABEL[t]+(last? ' <span class="footnote" style="margin:0;">(ค่าล่าสุดในระบบ '+last.value+')</span>':'')+'</div>'+
+      '<div class="field-row"><div class="field"><label>เลขมิเตอร์วันเข้าพัก</label><input type="number" step="'+(t==='water'?'1':'0.1')+'" min="0" name="ms_'+t+'" data-last="'+(last?last.value:'')+'"></div>'+
+      '<div class="field"><label>รูปถ่ายมิเตอร์</label><input type="file" accept="image/*" capture="environment" name="msphoto_'+t+'"></div></div>'+
+      '<div data-msai="'+t+'" style="margin:-4px 0 8px;"></div></div>';
+  };
+  return '<div class="field"><label>มิเตอร์เริ่มต้นวันเข้าพัก (*บังคับ)</label>'+
+    '<p class="hint">ถ่ายรูปมิเตอร์น้ำ-ไฟวันที่ผู้เช่าเข้าพัก แล้วให้ AI อ่านเลข (คุณตรวจ/แก้ได้) หรือกรอกเอง — ใช้เป็นค่าตั้งต้นคิดค่าน้ำ-ไฟของผู้เช่ารายนี้ ไม่คิดรวมการใช้ของผู้เช่าเดิม</p>'+
+    types.map(row).join('')+
+    '<label style="display:flex;gap:8px;align-items:center;font-weight:400;margin:6px 0;"><input type="checkbox" name="ms_skip" style="width:auto;"> ยังไม่ได้จดเลขตอนนี้ — ใช้ค่ามิเตอร์สิ้นเดือนก่อนหน้าแทน</label>'+
+    '<label id="msLowWrap" style="display:none;gap:8px;align-items:center;font-weight:400;margin:6px 0;color:var(--danger);"><input type="checkbox" name="ms_lowok" style="width:auto;"> เลขที่กรอกต่ำกว่าค่าล่าสุดในระบบ — ยืนยันว่าถูกต้อง (เช่น เปลี่ยนมิเตอร์/มิเตอร์วนรอบ)</label></div>';
+}
+function wireMeterStart(modalEl, room){
+  ['water','elec'].forEach(t=>{
+    const box = $('[data-mstart="'+t+'"]', modalEl); if(!box) return;
+    wireMeterAi({ fileInput: $('[name="msphoto_'+t+'"]', box), valueInput: $('[name="ms_'+t+'"]', box), btnHost: $('[data-msai="'+t+'"]', box), type:t, label: t==='water'?'น้ำ':'ไฟ' });
+    const v = $('[name="ms_'+t+'"]', box);
+    v.addEventListener('input', ()=>{
+      const low = ['water','elec'].some(x=>{ const el = $('[name="ms_'+x+'"]', modalEl); const lastV = el && el.dataset.last!=='' ? Number(el.dataset.last) : null; return el && el.value!=='' && lastV!=null && Number(el.value) < lastV; });
+      const w = $('#msLowWrap', modalEl); if(w) w.style.display = low ? 'flex' : 'none';
+    });
+  });
+}
+/* reads the move-in meter fields out of the form; throws a Thai message if invalid. returns {water:{value,photoFile}, elec:{...}} or null when skipped */
+function collectMeterStart(fd, room){
+  const types = ['water','elec'].filter(t=>meterRequired(room,t));
+  if(!types.length || fd.get('ms_skip')) return null;
+  const out = {};
+  types.forEach(t=>{
+    const raw = fd.get('ms_'+t);
+    if(raw===null || String(raw).trim()==='') throw new Error('กรอกเลขมิเตอร์'+METER_TYPE_LABEL[t]+'วันเข้าพัก (หรือติ๊ก "ยังไม่ได้จดเลขตอนนี้")');
+    const v = Number(raw); if(isNaN(v) || v<0) throw new Error('เลขมิเตอร์'+METER_TYPE_LABEL[t]+'ไม่ถูกต้อง');
+    const last = latestReadingFor(room.id, t, '999999');
+    if(last && v < Number(last.value) && !fd.get('ms_lowok')) throw new Error('เลขมิเตอร์'+METER_TYPE_LABEL[t]+' ('+v+') ต่ำกว่าค่าล่าสุดในระบบ ('+last.value+') — ตรวจเลขอีกครั้ง หรือติ๊กยืนยันว่าถูกต้อง');
+    const f = fd.get('msphoto_'+t);
+    out[t] = { value:v, photoFile: (f && f.size) ? f : null };
+  });
+  return out;
+}
+async function recordMoveInBaselines(room, startDate, meterStart){
+  if(!meterStart) return;
+  const period = moveInBaselinePeriod(startDate);
+  for(const t of ['water','elec']){
+    const m = meterStart[t]; if(!m) continue;
+    const photoDataUrl = m.photoFile ? await fileToCompressedDataUrl(m.photoFile) : '';
+    const payload = { roomId:room.id, roomCode:room.code, type:t, period, value:m.value, previousValue:m.value, usage:0, photoDataUrl,
+      baseline:true, moveIn:true, startDate, recordedBy:Session.user.id, recordedByName:Session.user.name, timestamp:nowIso(), editLog:[],
+      verificationStatus:'verified', locked:true, invoiceId:'', note:'เลขมิเตอร์วันเข้าพัก' };
+    const old = cache.meterReadings.find(r=>r.roomId===room.id && r.type===t && r.period===period && r.baseline);
+    if(old) await Store.update('meterReadings', old.id, payload); else await Store.add('meterReadings', payload);
+    await logAudit({action:'MOVE_IN_METER_BASELINE', entityType:'meterReading', entityId:room.id, newValue:{roomCode:room.code, type:t, value:m.value, period}});
+  }
+}
+
+/* ============================================================
    ROUTER / SHELL
    ============================================================ */
 const NAV = [
@@ -1935,7 +2182,7 @@ function renderRooms(root){
     const docsModalEl = openModal({title:'เอกสารผู้เช่า — ห้อง '+(lease?lease.roomCode:''), submitLabel:'ปิด', onSubmit: async ()=>{}, bodyHtml:
       '<div class="field"><label>ที่อยู่ผู้เช่า</label><p>'+escapeHtml((tenant&&tenant.address)||'-')+'</p></div>'+
       '<div class="field"><label>รูปถ่ายบัตรประชาชน</label>'+
-        ((tenant&&tenant.idCardPhotoUrl)? '<img class="photo-thumb" data-zoom="'+tenant.idCardPhotoUrl+'" src="'+tenant.idCardPhotoUrl+'">' : '<span class="pill bad">ไม่มีรูป (ผูกผู้เช่าก่อนใช้ระบบเวอร์ชันนี้)</span>')+'</div>'+
+        ((tenant&&tenant.idCardPhotoUrl)? '<img class="photo-thumb" data-zoom="'+tenant.idCardPhotoUrl+'" src="'+tenant.idCardPhotoUrl+'">' : (STORE_ID_PHOTO ? '<span class="pill bad">ไม่มีรูป (ผูกผู้เช่าก่อนใช้ระบบเวอร์ชันนี้)</span>' : '<span class="pill muted">ไม่เก็บรูปบัตร — เก็บเฉพาะชื่อและที่อยู่</span>'))+'</div>'+
       '<div class="field"><label>รูปถ่ายสัญญาเช่า</label>'+
         ((lease&&lease.contractPhotoUrl)? '<img class="photo-thumb" data-zoom="'+lease.contractPhotoUrl+'" src="'+lease.contractPhotoUrl+'">' : '<span class="pill bad">ไม่มีรูป (ผูกผู้เช่าก่อนใช้ระบบเวอร์ชันนี้)</span>')+'</div>'});
     $all('[data-zoom]', docsModalEl).forEach(img=>img.addEventListener('click', ()=>lightbox(img.dataset.zoom)));
@@ -2038,33 +2285,35 @@ function openEditStaffModal(s){
 /* Shared tenant-binding form used both from the room "+ ผูกผู้เช่า" action and from
    confirming a room booking. Requires name/address/phone plus ID-card and contract photo
    evidence — anti-fraud requirement. `onSubmit(data)` receives the assembled tenant data. */
-function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhone, prefillDeposit, prefillRent, prefillStart, onSubmit}){
-  openModal({title, submitLabel: submitLabel||'บันทึก', onSubmit: async fd=>{
+function openBindTenantModal(room, {title, submitLabel, prefillName, prefillPhone, prefillAddress, prefillDeposit, prefillRent, prefillStart, onSubmit}){
+  let scan = null;
+  const modalEl = openModal({title, submitLabel: submitLabel||'บันทึก', onSubmit: async fd=>{
     const name = (fd.get('name')||'').trim();
     const address = (fd.get('address')||'').trim();
     const phone = (fd.get('phone')||'').trim();
     if(!name) throw new Error('กรุณากรอกชื่อ-สกุลผู้เช่า');
     if(!address) throw new Error('กรุณากรอกที่อยู่ผู้เช่า');
     if(!phone) throw new Error('กรุณากรอกเบอร์โทรผู้เช่า');
-    const idFile = fd.get('idCardPhoto');
     const contractFile = fd.get('contractPhoto');
-    if(!idFile || !idFile.size) throw new Error('กรุณาแนบรูปถ่ายบัตรประชาชนผู้เช่า');
     if(!contractFile || !contractFile.size) throw new Error('กรุณาแนบรูปถ่ายสัญญาเช่า');
-    const idCardPhotoUrl = await fileToCompressedDataUrl(idFile);
+    const meterStart = collectMeterStart(fd, room);
+    const idCardPhotoUrl = (STORE_ID_PHOTO && scan && scan.file) ? await fileToCompressedDataUrl(scan.file) : '';
     const contractPhotoUrl = await fileToCompressedDataUrl(contractFile);
-    await onSubmit({name, address, phone, rent:Number(fd.get('rent')), deposit:Number(fd.get('deposit')||0), startDate:fd.get('startDate'), termMonths:Number(fd.get('termMonths')||0), idCardPhotoUrl, contractPhotoUrl});
+    await onSubmit({name, address, phone, rent:Number(fd.get('rent')), deposit:Number(fd.get('deposit')||0), startDate:fd.get('startDate'), termMonths:Number(fd.get('termMonths')||0), idCardPhotoUrl, contractPhotoUrl, meterStart});
   }, bodyHtml:
+    idScanHtml()+
     '<div class="field"><label>ชื่อ-สกุลผู้เช่า (*บังคับ)</label><input name="name" required value="'+escapeHtml(prefillName||'')+'"></div>'+
-    '<div class="field"><label>ที่อยู่ (*บังคับ)</label><textarea name="address" required placeholder="ที่อยู่ตามบัตรประชาชนหรือที่อยู่ปัจจุบัน"></textarea></div>'+
+    '<div class="field"><label>ที่อยู่ (*บังคับ)</label><textarea name="address" required placeholder="ที่อยู่ตามบัตรประชาชนหรือที่อยู่ปัจจุบัน">'+escapeHtml(prefillAddress||'')+'</textarea></div>'+
     '<div class="field"><label>เบอร์โทร (*บังคับ)</label><input name="phone" required placeholder="08x-xxx-xxxx" value="'+escapeHtml(prefillPhone||'')+'"></div>'+
     '<div class="field-row"><div class="field"><label>ค่าเช่า (บาท) — ตามค่า default (แก้ไขได้)</label><input name="rent" type="number" required value="'+(prefillRent!=null?prefillRent:room.rent)+'"></div>'+
     '<div class="field"><label>วันที่เข้าพัก</label><input name="startDate" type="date" required value="'+(prefillStart||todayStr())+'"></div></div>'+
     '<div class="field"><label>ระยะเวลาสัญญาเช่า (เดือน) (*บังคับ)</label><select name="termMonths" required>'+[1,2,3,4,5,6,7,8,9,10,11,12,18,24,36].map(n=>'<option value="'+n+'" '+(n===12?'selected':'')+'>'+n+' เดือน'+(n===12?' (ค่าเริ่มต้น)':'')+'</option>').join('')+'</select><p class="hint">ถ้าผู้เช่าย้ายออกก่อนครบสัญญา จะไม่คืนเงินมัดจำ · เมื่อครบสัญญาแล้วยังไม่ย้ายออก สัญญาต่ออัตโนมัติด้วยระยะเวลาเท่าเดิม</p></div>'+
     '<div class="field"><label>เงินมัดจำที่รับ (บาท) — ปกติ 1 เดือนของค่าเช่า</label><input name="deposit" type="number" min="0" step="0.01" value="'+(prefillDeposit!=null?prefillDeposit:room.rent)+'"><p class="hint">ใช้คำนวณเงินคืนตอนสิ้นสุดสัญญา</p></div>'+
-    '<div class="field"><label>รูปถ่ายบัตรประชาชน (*บังคับ)</label><input name="idCardPhoto" type="file" accept="image/*" capture="environment" required>'+
-    '<p class="hint">'+icon('camera')+' ถ่ายรูปบัตรประชาชนผู้เช่าหรือแนบไฟล์รูป ระบบจะบีบอัดไฟล์อัตโนมัติ</p></div>'+
+    meterStartBlockHtml(room, prefillStart||todayStr())+
     '<div class="field"><label>รูปถ่ายสัญญาเช่า (*บังคับ)</label><input name="contractPhoto" type="file" accept="image/*" capture="environment" required>'+
     '<p class="hint">'+icon('camera')+' ถ่ายรูปสัญญาเช่าที่เซ็นแล้วหรือแนบไฟล์รูป ระบบจะบีบอัดไฟล์อัตโนมัติ</p></div>'});
+  scan = wireIdScan(modalEl, '[name="name"]', '[name="address"]');
+  wireMeterStart(modalEl, room);
 }
 function openLeaseModal(room){
   openBindTenantModal(room, {title:'ผูกผู้เช่าเข้าห้อง '+room.code, submitLabel:'ผูกผู้เช่า', onSubmit: async data=>{
@@ -2142,7 +2391,7 @@ function renderBookings(root){
     const rv = cache.reservations.find(x=>x.id===b.dataset.confirm);
     const room = roomById(rv.roomId);
     openBindTenantModal(room, {title:'ยืนยันเข้าพักห้อง '+rv.roomCode, submitLabel:'ยืนยันเข้าพัก',
-      prefillName:rv.tenantName, prefillPhone:rv.phone, prefillRent: rv.rent!=null? Number(rv.rent) : null, prefillDeposit: rv.rent!=null? Number(rv.rent) : null, prefillStart: rv.moveInDate||'', onSubmit: async data=>{ await confirmMoveIn(rv, data); }});
+      prefillName:rv.tenantName, prefillPhone:rv.phone, prefillAddress:rv.address||'', prefillRent: rv.rent!=null? Number(rv.rent) : null, prefillDeposit: rv.rent!=null? Number(rv.rent) : null, prefillStart: rv.moveInDate||'', onSubmit: async data=>{ await confirmMoveIn(rv, data); }});
   }));
   $all('[data-cancelbook]', pw).forEach(b=>b.addEventListener('click', ()=>{
     const rv = cache.reservations.find(x=>x.id===b.dataset.cancelbook);
@@ -2167,13 +2416,15 @@ function renderBookings(root){
       const file = fd.get('depositSlip');
       let depositSlipDataUrl = '';
       if(file && file.size>0) depositSlipDataUrl = await fileToCompressedDataUrl(file);
-      await createReservation({roomId:fd.get('roomId'), tenantName:fd.get('tenantName'), phone:fd.get('phone'),
+      await createReservation({roomId:fd.get('roomId'), tenantName:fd.get('tenantName'), phone:fd.get('phone'), address:fd.get('address'),
         moveInDate:fd.get('moveInDate'), depositAmount:fd.get('depositAmount'), rent:fd.get('rent'), note:fd.get('note'), depositSlipDataUrl});
     }, bodyHtml:
       '<div class="field"><label>หอพัก</label><select name="propertyId" id="bookPropSel">'+bookProps.map(p=>
         '<option value="'+p.id+'" '+(p.id===defaultPropId?'selected':'')+'>'+escapeHtml(p.name)+' ('+p.code+')</option>').join('')+'</select></div>'+
       '<div class="field"><label>ห้องว่าง</label><select name="roomId" id="bookRoomSel" required></select></div>'+
+      idScanHtml()+
       '<div class="field"><label>ชื่อ-สกุล ผู้จอง (*บังคับ)</label><input name="tenantName" required></div>'+
+      '<div class="field"><label>ที่อยู่ (ไม่บังคับ — ถ้าอ่านจากบัตรแล้วจะส่งต่อไปตอนยืนยันเข้าพักอัตโนมัติ)</label><textarea name="address" placeholder="ที่อยู่ตามบัตรประชาชนหรือที่อยู่ปัจจุบัน"></textarea></div>'+
       '<div class="field"><label>เบอร์โทร (*บังคับ)</label><input name="phone" required placeholder="08x-xxx-xxxx"></div>'+
       '<div class="field"><label>ค่าเช่าต่อเดือน (บาท) — แก้ได้ถ้าต้องการเพิ่ม/ลดราคาเฉพาะการจองนี้</label><input name="rent" id="bookRent" type="number" min="1" step="0.01" required><p class="hint" id="bookRentHint"></p></div>'+
       '<div class="field-row"><div class="field"><label>วันที่จะเข้าพัก (*บังคับ)</label><input name="moveInDate" type="date" required value="'+todayStr()+'"></div>'+
@@ -2181,6 +2432,7 @@ function renderBookings(root){
       '<div class="field"><label>หมายเหตุ</label><input name="note" placeholder="ไม่บังคับ"></div>'+
       '<div class="field"><label>รูปหลักฐานการโอนเงินมัดจำ (*บังคับ)</label><input name="depositSlip" type="file" accept="image/*" capture="environment" required>'+
       '<p class="hint">'+icon('camera')+' ถ่ายรูปสลิปโอนเงินหรือแนบไฟล์รูปหลักฐาน ระบบจะบีบอัดไฟล์อัตโนมัติ</p></div>'});
+    wireIdScan(modalEl, '[name="tenantName"]', '[name="address"]');
     const propSel = $('#bookPropSel', modalEl);
     const roomSel = $('#bookRoomSel', modalEl);
     function fillRooms(){
@@ -2428,7 +2680,7 @@ function meterTypeBlockHtml(room, type){
   const rd = readingFor(room.id, type, meterPeriodSel);
   const prevRd = latestReadingFor(room.id, type, meterPeriodSel);
   const prevVal = rd ? rd.previousValue : (prevRd ? prevRd.value : '-');
-  const prevCap = prevRd ? '<span class="mf-sub">'+periodLabel(prevRd.period)+(prevRd.baseline?' · ค่าตั้งต้น':'')+'</span>' : '';
+  const prevCap = prevRd ? '<span class="mf-sub">'+(prevRd.moveIn ? 'ค่าตั้งต้นวันเข้าพัก '+fmtDate(prevRd.startDate) : periodLabel(prevRd.period)+(prevRd.baseline?' · ค่าตั้งต้น':''))+'</span>' : '';
   return '<div class="meter-type-block"><div class="meter-type-name">'+typeLabel+
       (rd ? (rd.locked? ' <span class="pill info">ล็อกแล้ว (ออกบิลแล้ว)</span>' : (rd.verificationStatus==='verified'?' <span class="pill ok">ตรวจแล้ว</span>':' <span class="pill warn">รอตรวจสอบ</span>')) : ' <span class="pill bad">ยังไม่จด</span>')+
       (noBilling ? ' <span class="pill muted">'+(mode==='FLAT'?'เหมาจ่าย':'รวมค่าเช่า')+' · ไม่มีผลต่อบิล</span>' : '')+
@@ -2508,7 +2760,7 @@ function openMeterModal(room, type, existing){
   }, bodyHtml:
     ((type==='water'&&roomWaterMode(room)==='FLAT')? '<div class="help-box">ห้องนี้คิดค่าน้ำแบบเหมาจ่าย ('+money(roomWaterFlatFee(room))+' บาท/เดือน) ยังคงต้องจดมิเตอร์เพื่อใช้ตรวจจับความผิดปกติ แม้จะไม่มีผลต่อยอดบิล</div>':'')+
     '<div class="field"><label>ค่ามิเตอร์ก่อนหน้า</label><input value="'+(existing? existing.previousValue : (latestReadingFor(room.id,type,meterPeriodSel)? latestReadingFor(room.id,type,meterPeriodSel).value : 0))+'" disabled></div>'+
-    '<div class="field"><label>ค่ามิเตอร์ปัจจุบัน</label><input name="value" id="meterValueInput" type="number" required value="'+(existing? existing.value:'')+'"></div>'+
+    '<div class="field"><label>ค่ามิเตอร์ปัจจุบัน</label><input name="value" id="meterValueInput" type="number" step="any" required value="'+(existing? existing.value:'')+'"></div>'+
     '<div class="field"><label>รูปถ่ายมิเตอร์ '+(existing&&existing.photoDataUrl?'(มีรูปอยู่แล้ว — เลือกใหม่เพื่อแทนที่)':'(ไม่บังคับ)')+'</label>'+
     '<input name="photo" id="meterPhotoInput" type="file" accept="image/*" capture="environment">'+
     '<div id="ocrAssistWrap" style="margin-top:8px;"></div>'+
@@ -2517,42 +2769,7 @@ function openMeterModal(room, type, existing){
   const photoInput = $('#meterPhotoInput', modalEl);
   const ocrWrap = $('#ocrAssistWrap', modalEl);
   const valueInput = $('#meterValueInput', modalEl);
-  if(photoInput && !ocrPermanentlyHidden){
-    photoInput.addEventListener('change', async ()=>{
-      ocrWrap.innerHTML = '';
-      const file = photoInput.files && photoInput.files[0];
-      if(!file || !sampleApi) return;
-      let limits;
-      try{ limits = await sampleApi.limits(); }catch(e){ return; }
-      if(!limits || !limits.images) return;
-      const btn = document.createElement('button');
-      btn.type = 'button'; btn.className = 'btn sm';
-      const label = icon('sparkle')+' อ่านตัวเลขจากรูปอัตโนมัติ (AI)';
-      btn.innerHTML = label;
-      ocrWrap.appendChild(btn);
-      btn.addEventListener('click', async ()=>{
-        btn.disabled = true; btn.innerHTML = 'กำลังอ่านตัวเลข...';
-        try{
-          const result = await sampleApi.json(
-            'อ่านตัวเลขที่แสดงบนหน้าปัดมิเตอร์'+(type==='water'?'น้ำประปา':'ไฟฟ้า')+'ในรูปนี้ให้แม่นยำที่สุด แล้วตอบกลับเป็น JSON เท่านั้นในรูปแบบ {"value": <ตัวเลขจำนวนเต็มที่อ่านได้จากมิเตอร์>} ห้ามมีคำอธิบายอื่นใด',
-            {images: [file]}
-          );
-          if(result && typeof result.value !== 'undefined' && !isNaN(Number(result.value))){
-            valueInput.value = Math.round(Number(result.value));
-            toast('อ่านค่ามิเตอร์อัตโนมัติแล้ว ('+valueInput.value+') — กรุณาตรวจสอบความถูกต้องก่อนบันทึก','ok');
-          } else {
-            toast('ระบบอ่านตัวเลขจากรูปไม่สำเร็จ กรุณากรอกด้วยตนเอง','warn');
-          }
-        }catch(err){
-          const permanentHide = ['not_granted','images_unavailable','sampling_disabled','not_declared','capability_disabled','capability_removed','tools_unavailable'];
-          if(err && permanentHide.includes(err.code)){ ocrPermanentlyHidden = true; btn.remove(); }
-          else { toast('อ่านค่าอัตโนมัติไม่สำเร็จ กรุณากรอกด้วยตนเอง','warn'); }
-        } finally {
-          if(document.body.contains(btn)){ btn.disabled = false; btn.innerHTML = label; }
-        }
-      });
-    });
-  }
+  if(photoInput && ocrWrap && valueInput) wireMeterAi({fileInput:photoInput, valueInput, btnHost:ocrWrap, type, label: type==='water'?'น้ำ':'ไฟ'});
 }
 
 /* ============================================================
@@ -3583,7 +3800,7 @@ function rentBetween(rent, fromStr, toStr){
 }
 /* meter value that has already been billed (or the opening baseline) for a room/type */
 function billedMeterBase(roomId, type){
-  const rows = cache.meterReadings.filter(r=>r.roomId===roomId && r.type===type && !r.moveOut).sort((a,b)=>a.period<b.period?-1:1);
+  const rows = cache.meterReadings.filter(r=>r.roomId===roomId && r.type===type && !r.moveOut).sort((a,b)=>a.period<b.period?-1:(a.period>b.period?1:((a.timestamp||'')<(b.timestamp||'')?-1:1)));
   const billed = rows.filter(r=>r.invoiceId || r.baseline);
   if(billed.length) return { value: Number(billed[billed.length-1].value), period: billed[billed.length-1].period };
   if(rows.length) return { value: Number(rows[0].previousValue||0), period: '' };
