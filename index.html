@@ -496,6 +496,13 @@ async function lineCall(action, payload){
   return j;
 }
 
+/* When a move-out is closed (REFUNDED / SETTLED) the room's old customer LINE group is dropped (binding + "seen groups" list). Needs km-line v6+; an older server just ignores it. */
+async function releaseMoveOutGroup(m){
+  try{
+    const r = await lineCall('release_room_group', { id:m.id });
+    if(r && r.released) toast('ลบการผูกกลุ่มไลน์ของห้อง '+m.roomCode+' แล้ว (บอทยังอยู่ในกลุ่ม — เอาบอทออกจากกลุ่มได้ในไลน์)','ok');
+  }catch(e){ /* best effort: the move-out itself is already saved */ }
+}
 /* LINE cannot unsend a message the bot already pushed — "cancelling a send" = an automatic follow-up notice in the same room group */
 /* Every message that goes to a LINE group is shown first (exact text) and only sent after a second, explicit confirmation */
 /* Preview/dry-run flags only exist on server v5+. An older km-line would IGNORE them and really send / approve, so check first. */
@@ -3882,7 +3889,8 @@ async function saveMoveOut(lease, f, existing){
     toast('บันทึกการแก้ไขสรุปคืนเงินมัดจำแล้ว','ok'); return existing.id;
   }
   if(f.termMonths>0 && !(lease.termMonths>0)) await Store.update('leases', lease.id, {termMonths:Number(f.termMonths), termEndDate:f.termEnd});
-  const id = await Store.add('moveOuts', { ...doc, status:'DRAFT', createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
+  let lineGroupId = ''; try{ lineGroupId = ((await lineCall('room_groups')).roomGroups||{})[lease.roomId] || ''; }catch(e){ /* STAFF or old server: server falls back to the room's current binding */ }
+  const id = await Store.add('moveOuts', { ...doc, lineGroupId, status:'DRAFT', createdAt: nowIso(), createdBy: Session.user.id, createdByName: Session.user.name,
     bank:null, accountMessages:[], lineSentAt:'', refundedAt:'' });
   // end the lease, free the room
   await Store.update('leases', lease.id, {active:false, endDate: f.moveOutDate, moveOutId:id});
@@ -4025,7 +4033,7 @@ function renderMoveOuts(root){
   $all('[data-morefund]', root).forEach(b=>b.addEventListener('click', ()=>openMoveOutRefundModal(find(b.dataset.morefund))));
   $all('[data-moclose]', root).forEach(b=>b.addEventListener('click', ()=>{ const m = find(b.dataset.moclose);
     confirmModal({title:'ปิดรายการ — ห้อง '+m.roomCode, submitLabel:'ปิดรายการ', bodyHtml:'<p>'+(m.refund<0?'ยืนยันว่าได้รับชำระส่วนที่ขาด '+money(-m.refund)+' บาท จากลูกค้าแล้ว?':'ยืนยันปิดรายการ (ไม่มียอดคืน)?')+'</p>',
-      onSubmit: async ()=>{ await Store.update('moveOuts', m.id, {status:'SETTLED', settledAt:nowIso(), settledByName:Session.user.name}); await logAudit({action:'SETTLE_MOVEOUT', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, refund:m.refund}}); toast('ปิดรายการแล้ว','ok'); }}); }));
+      onSubmit: async ()=>{ await Store.update('moveOuts', m.id, {status:'SETTLED', settledAt:nowIso(), settledByName:Session.user.name}); await logAudit({action:'SETTLE_MOVEOUT', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, refund:m.refund}}); toast('ปิดรายการแล้ว','ok'); await releaseMoveOutGroup(m); }}); }));
 }
 async function cancelMoveOutSummary(m, reason){
   if(!reason || !reason.trim()) throw new Error('ต้องระบุเหตุผลที่ยกเลิกสรุป');
@@ -4073,6 +4081,7 @@ function openMoveOutRefundModal(m){
     await logAudit({action:'REFUND_DEPOSIT', entityType:'moveOut', entityId:m.id, newValue:{roomCode:m.roomCode, amount, date:fd.get('date')}});
     toast('บันทึกโอนคืนเงินมัดจำแล้ว','ok');
     if(fd.get('notify')){ try{ await lineCall('moveout_send', {id:m.id, kind:'refunded'}); toast('แจ้งในกลุ่มไลน์แล้ว','ok'); }catch(e){ toast('บันทึกแล้ว แต่ส่งข้อความเข้ากลุ่มไม่สำเร็จ: '+e.message,'warn'); } }
+    await releaseMoveOutGroup(m);
   }, bodyHtml:
     '<div class="help-box">ระบบนี้ไม่โอนเงินให้ — โอนเงินเองที่แอปธนาคาร แล้วกลับมาบันทึกที่นี่'+(b?'<br>บัญชีปลายทาง: <b>'+escapeHtml(b.bankName)+' '+escapeHtml(b.accountNo)+' '+escapeHtml(b.accountName)+'</b>':'')+'</div>'+
     '<div class="field-row"><div class="field"><label>ยอดที่โอนคืน (บาท)</label><input name="amount" type="number" step="0.01" min="0" required value="'+m.refund+'"></div>'+
