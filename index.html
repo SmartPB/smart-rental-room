@@ -1494,7 +1494,8 @@ function computeRoomPaymentStatus(){
     return a.code<b.code?-1:1;
   }).map(r=>{
     const lease = activeLeaseFor(r.id);
-    const inv = cache.invoices.find(i=>i.roomId===r.id && i.period===period && i.status!=='cancelled');
+    // an invoice tied to a move-out belongs to the PREVIOUS tenant (settled from his deposit) — never show it as the new tenant's status
+    const inv = cache.invoices.find(i=>i.roomId===r.id && i.period===period && i.status!=='cancelled' && !i.moveOutId);
     let status;
     if(!inv) status = 'NONE';
     else if(inv.status==='paid') status = 'PAID';
